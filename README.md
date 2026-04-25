@@ -15,7 +15,10 @@ The application (modelEditor) is a tool for building, painting, and editing
 - AABB fast-path raycasting for rectangular meshes
 - FPS camera with mouse look (Q toggle) and WASD movement
 - Scene system with lifecycle hooks (enter, exit, input, update, render)
-- UI system with buttons, panels, text inputs, dropdowns, images
+- UI system with buttons, panels, text inputs, dropdowns, images. Inputs
+  use a GLFW character callback for layout-aware printable-ASCII input,
+  support an in-input caret (Left/Right/Backspace operate at the caret),
+  and an opt-in `numericOnly` filter for digit/`.`/`-` fields.
 - Text rendering via FreeType font rasterization
 - Line and dot rendering for wireframes and debug visualization
 - Triangle overlay system for selection highlights
@@ -55,12 +58,24 @@ The application (modelEditor) is a tool for building, painting, and editing
 ### Custom Mesh Editor (Vector Mesh)
 - Create custom 3D shapes from scratch
 - Dot mode: place vertices with snap-to-edge (configurable snap count)
+  - Click a placed vertex to select it (magenta highlight) and live-edit
+    its X/Y/Z coordinates from the right sidebar — edits are written to
+    the vertex every frame, so all triangles/lines that reference it
+    follow the move automatically (indices stay intact)
 - Line mode: connect dots into edges
 - Plane mode: create triangles from 3 dots
-- Flip triangle normals manually when needed
+  - Multi-select triangles: plain click replaces, Ctrl+click toggles,
+    Shift+click adds, click empty space clears
+  - **Flip Normal(s)** acts on the whole selection
+  - **Subdivide** splits each selected triangle into 4 children with
+    shared midpoint vertices; selection extends to include the new
+    children so you can keep subdividing
 - Saves as .vmesh (editable) + .mesh (renderable with pre-computed normals)
 - Custom meshes appear in the block selector for placement
-- Ctrl+Z undo with 50-step history
+- Single **Save & Exit** button in the pause menu (saves .vmesh, exports
+  .mesh, returns to 3dModeler / menu)
+- Ctrl+Z undo with 50-step history (one snapshot per coord-edit focus
+  session, so typing keystrokes don't flood the stack)
 - Ctrl+Tab to save and return to the 3D modeler
 - Built-in prefab meshes (cube, wedge) are protected from editing
 

@@ -242,9 +242,14 @@ void renderUI() {
                 } else if (!drawCopy.multiline) {
                     std::string display = drawCopy.inputText;
                     if (drawCopy.focused) {
+                        int cp = drawCopy.caretPos;
+                        if (cp < 0) cp = 0;
+                        if (cp > (int)display.size()) cp = (int)display.size();
                         double time = glfwGetTime();
-                        if (((int)(time * 2.0)) % 2 == 0)
-                            display += "|";
+                        bool on = ((int)(time * 2.0)) % 2 == 0;
+                        // Always reserve the caret slot so chars to the right
+                        // don't shift between blink phases.
+                        display.insert(display.begin() + cp, on ? '|' : ' ');
                     }
                     drawText(display, pixX + padding,
                         pixY - pixH / 2.0f - textH / 2.0f,
@@ -255,8 +260,12 @@ void renderUI() {
                     // the scene (which sizes the element accordingly).
                     std::string display = drawCopy.inputText;
                     if (drawCopy.focused) {
+                        int cp = drawCopy.caretPos;
+                        if (cp < 0) cp = 0;
+                        if (cp > (int)display.size()) cp = (int)display.size();
                         double time = glfwGetTime();
-                        if (((int)(time * 2.0)) % 2 == 0) display += "|";
+                        bool on = ((int)(time * 2.0)) % 2 == 0;
+                        display.insert(display.begin() + cp, on ? '|' : ' ');
                     }
                     const float usableW = pixW - 2.0f * padding;
                     auto lines = wrapTextToWidth(display, usableW, drawCopy.labelScale);
@@ -304,55 +313,69 @@ static void updateHover() {
     }
 }
 
+// Buffer of printable characters typed since last drain. Filled by GLFW's
+// character callback (which respects shift, layout, dead keys, etc.) and
+// drained into the focused input each frame in processTextInput().
+static std::string sCharBuffer;
+static bool sCharCallbackInstalled = false;
+
+static void uiCharCallback(GLFWwindow* /*win*/, unsigned int codepoint) {
+    // Printable ASCII only. Wider unicode can be added later if needed.
+    if (codepoint >= 0x20 && codepoint <= 0x7E)
+        sCharBuffer.push_back((char)codepoint);
+}
+
 static void processTextInput() {
+    if (!sCharCallbackInstalled && ctx.window) {
+        glfwSetCharCallback(ctx.window, uiCharCallback);
+        sCharCallbackInstalled = true;
+    }
+
     UIElement* input = getFocusedInput();
-    if (!input) return;
+    if (!input) {
+        // Don't queue keystrokes when no input is focused.
+        sCharBuffer.clear();
+        return;
+    }
 
-    // Letters A-Z
-    for (int key = GLFW_KEY_A; key <= GLFW_KEY_Z; key++) {
-        bool down = glfwGetKey(ctx.window, key) == GLFW_PRESS;
-        if (down && !sKeyStates[key] && (int)input->inputText.size() < input->maxLength) {
-            bool shift = glfwGetKey(ctx.window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-                         glfwGetKey(ctx.window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
-            char c = shift ? ('A' + (key - GLFW_KEY_A)) : ('a' + (key - GLFW_KEY_A));
-            input->inputText += c;
+    // Clamp caret in case inputText was mutated externally since last frame.
+    if (input->caretPos < 0) input->caretPos = 0;
+    if (input->caretPos > (int)input->inputText.size())
+        input->caretPos = (int)input->inputText.size();
+
+    for (char c : sCharBuffer) {
+        if ((int)input->inputText.size() >= input->maxLength) break;
+        if (input->numericOnly) {
+            if (!((c >= '0' && c <= '9') || c == '.' || c == '-')) continue;
         }
-        sKeyStates[key] = down;
+        input->inputText.insert(input->inputText.begin() + input->caretPos, c);
+        input->caretPos++;
     }
+    sCharBuffer.clear();
 
-    // Numbers 0-9
-    for (int key = GLFW_KEY_0; key <= GLFW_KEY_9; key++) {
-        bool down = glfwGetKey(ctx.window, key) == GLFW_PRESS;
-        if (down && !sKeyStates[key] && (int)input->inputText.size() < input->maxLength) {
-            input->inputText += ('0' + (key - GLFW_KEY_0));
-        }
-        sKeyStates[key] = down;
-    }
-
-    // Space
-    {
-        bool down = glfwGetKey(ctx.window, GLFW_KEY_SPACE) == GLFW_PRESS;
-        if (down && !sKeyStates[GLFW_KEY_SPACE] && (int)input->inputText.size() < input->maxLength)
-            input->inputText += ' ';
-        sKeyStates[GLFW_KEY_SPACE] = down;
-    }
-
-    // Backspace
+    // Backspace stays on key-poll: GLFW's char callback only emits printables.
     {
         bool down = glfwGetKey(ctx.window, GLFW_KEY_BACKSPACE) == GLFW_PRESS;
-        if (down && !sKeyStates[GLFW_KEY_BACKSPACE] && !input->inputText.empty())
-            input->inputText.pop_back();
+        if (down && !sKeyStates[GLFW_KEY_BACKSPACE] && input->caretPos > 0) {
+            input->inputText.erase(input->inputText.begin() + (input->caretPos - 1));
+            input->caretPos--;
+        }
         sKeyStates[GLFW_KEY_BACKSPACE] = down;
     }
 
-    // Minus/underscore
+    // Left/Right move caret within the input.
     {
-        bool down = glfwGetKey(ctx.window, GLFW_KEY_MINUS) == GLFW_PRESS;
-        if (down && !sKeyStates[GLFW_KEY_MINUS] && (int)input->inputText.size() < input->maxLength) {
-            bool shift = glfwGetKey(ctx.window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
-            input->inputText += shift ? '_' : '-';
-        }
-        sKeyStates[GLFW_KEY_MINUS] = down;
+        bool down = glfwGetKey(ctx.window, GLFW_KEY_LEFT) == GLFW_PRESS;
+        if (down && !sKeyStates[GLFW_KEY_LEFT] && input->caretPos > 0)
+            input->caretPos--;
+        sKeyStates[GLFW_KEY_LEFT] = down;
+    }
+    {
+        bool down = glfwGetKey(ctx.window, GLFW_KEY_RIGHT) == GLFW_PRESS;
+        if (down && !sKeyStates[GLFW_KEY_RIGHT] &&
+            input->caretPos < (int)input->inputText.size())
+            input->caretPos++;
+        sKeyStates[GLFW_KEY_RIGHT] = down;
     }
 }
 
@@ -395,6 +418,7 @@ bool handleUIClick(double mouseX, double mouseY, int screenWidth, int screenHeig
 
                 if (e.isTextInput) {
                     e.focused = true;
+                    e.caretPos = (int)e.inputText.size();
                     cancelPendingConfirm();
                     return true;
                 }

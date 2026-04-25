@@ -72,7 +72,13 @@ static std::vector<int> sPlaneSelectedDots; // indices into sPlacedDots, max 3
 struct PlacedTriangle { int dotA; int dotB; int dotC; bool flipped = false; };
 static std::vector<PlacedTriangle> sPlacedTriangles;
 static int sHoverTriIndex = -1;
-static int sSelectedTriIndex = -1;
+static std::unordered_set<int> sSelectedTris;
+
+// Vector mode: selected placed dot for live coordinate editing
+static int sSelectedDotIndex = -1;
+// One undo snapshot per coord-edit focus session, so typing keystrokes
+// don't flood the stack.
+static bool sCoordEditUndoPushed = false;
 
 // File state
 static std::string sVMeshName;
@@ -343,22 +349,12 @@ static void openVMeshPauseMenu() {
         }
     ));
 
-    addToGroup("vmesh_pause", createButton("vm_save",
+    addToGroup("vmesh_pause", createButton("vm_save_exit",
         btnX, -0.02f, btnW, btnH,
-        {0.1f, 0.4f, 0.15f, 0.95f}, "Save Model",
+        {0.1f, 0.4f, 0.15f, 0.95f}, "Save & Exit",
         []() {
             saveVectorMesh();
             exportVMeshToMesh();
-            sVMeshPaused = false;
-            VE::setBrightness(1.0f);
-            removeUIGroup("vmesh_pause");
-        }
-    ));
-
-    addToGroup("vmesh_pause", createButton("vm_exit",
-        btnX, -0.14f, btnW, btnH,
-        {0.3f, 0.1f, 0.1f, 0.9f}, "Exit",
-        []() {
             sVMeshPaused = false;
             VE::setBrightness(1.0f);
             removeUIGroup("vmesh_pause");
@@ -461,6 +457,45 @@ static const float SIDE_BTN_X = PANEL_X + PANEL_PAD;
 static const float SIDE_START_Y = 0.9f;
 static const float SIDE_GAP = SIDE_BTN_H + PANEL_PAD;
 
+// Subdivide each triangle in `indices` into 4 sub-triangles by connecting
+// edge midpoints. Reuses any existing vertex within 1e-4 of a midpoint.
+// The original triangle is replaced in-place at its old index (so existing
+// references stay valid), and 3 new triangles are appended per subdivision.
+// Returns the number of triangles subdivided. Caller pushes undo.
+static int subdivideTriangleIndices(std::vector<int> indices) {
+    if (indices.empty()) return 0;
+    // Sort descending + dedup so we don't subdivide the same triangle twice.
+    std::sort(indices.begin(), indices.end(), std::greater<int>());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+
+    auto findOrAddVert = [](const glm::vec3& p) -> int {
+        const float eps = 1e-4f;
+        for (int i = 0; i < (int)sPlacedDots.size(); i++) {
+            if (glm::distance(sPlacedDots[i], p) < eps) return i;
+        }
+        sPlacedDots.push_back(p);
+        return (int)sPlacedDots.size() - 1;
+    };
+
+    int subdivided = 0;
+    for (int idx : indices) {
+        if (idx < 0 || idx >= (int)sPlacedTriangles.size()) continue;
+        PlacedTriangle t = sPlacedTriangles[idx];
+        glm::vec3 A = sPlacedDots[t.dotA];
+        glm::vec3 B = sPlacedDots[t.dotB];
+        glm::vec3 C = sPlacedDots[t.dotC];
+        int abIdx = findOrAddVert((A + B) * 0.5f);
+        int bcIdx = findOrAddVert((B + C) * 0.5f);
+        int caIdx = findOrAddVert((C + A) * 0.5f);
+        sPlacedTriangles[idx] = {t.dotA, abIdx, caIdx, t.flipped};
+        sPlacedTriangles.push_back({abIdx, t.dotB, bcIdx, t.flipped});
+        sPlacedTriangles.push_back({caIdx, bcIdx, t.dotC, t.flipped});
+        sPlacedTriangles.push_back({abIdx, bcIdx, caIdx, t.flipped});
+        subdivided++;
+    }
+    return subdivided;
+}
+
 static void rebuildModeTools() {
     removeUIGroup("mode_tools");
     addUIGroup("mode_tools");
@@ -476,29 +511,129 @@ static void rebuildModeTools() {
         ));
         y -= SIDE_GAP;
 
-        addToGroup("mode_tools", createTextInput("snap_input",
+        UIElement snapInput = createTextInput("snap_input",
             SIDE_BTN_X, y, SIDE_BTN_W, SIDE_BTN_H,
             {0.18f, 0.18f, 0.18f, 0.95f},
-            "Enter value...", 3
-        ));
+            "Enter value...", 3);
+        snapInput.numericOnly = true;
+        addToGroup("mode_tools", snapInput);
         y -= SIDE_GAP;
     } else if (sDrawMode == 1) { // Line
         // Line mode tools can go here
     } else if (sDrawMode == 2) { // Plane
-        if (sSelectedTriIndex >= 0 && sSelectedTriIndex < (int)sPlacedTriangles.size()) {
+        if (!sSelectedTris.empty()) {
+            std::string flipLabel = sSelectedTris.size() > 1
+                ? "Flip Normals (" + std::to_string(sSelectedTris.size()) + ")"
+                : "Flip Normal";
             addToGroup("mode_tools", createButton("flip_normal",
                 SIDE_BTN_X, y, SIDE_BTN_W, SIDE_BTN_H,
-                {0.3f, 0.2f, 0.5f, 0.95f}, "Flip Normal",
+                {0.3f, 0.2f, 0.5f, 0.95f}, flipLabel,
                 []() {
-                    if (sSelectedTriIndex >= 0 && sSelectedTriIndex < (int)sPlacedTriangles.size()) {
-                        pushVMeshUndo();
-                        sPlacedTriangles[sSelectedTriIndex].flipped = !sPlacedTriangles[sSelectedTriIndex].flipped;
+                    if (sSelectedTris.empty()) return;
+                    pushVMeshUndo();
+                    int n = (int)sPlacedTriangles.size();
+                    for (int i : sSelectedTris) {
+                        if (i >= 0 && i < n)
+                            sPlacedTriangles[i].flipped = !sPlacedTriangles[i].flipped;
                     }
+                }
+            ));
+            y -= SIDE_GAP;
+
+            std::string subLabel = sSelectedTris.size() > 1
+                ? "Subdivide (" + std::to_string(sSelectedTris.size()) + ")"
+                : "Subdivide";
+            addToGroup("mode_tools", createButton("subdivide",
+                SIDE_BTN_X, y, SIDE_BTN_W, SIDE_BTN_H,
+                {0.2f, 0.4f, 0.3f, 0.95f}, subLabel,
+                []() {
+                    if (sSelectedTris.empty()) return;
+                    std::vector<int> indices(sSelectedTris.begin(), sSelectedTris.end());
+                    pushVMeshUndo();
+                    int oldCount = (int)sPlacedTriangles.size();
+                    int subdivided = subdivideTriangleIndices(indices);
+                    // Originals stay at their old indices; 3 new appended per
+                    // subdivision. Extend selection to include them so the
+                    // user can keep mashing Subdivide.
+                    for (int i = 0; i < 3 * subdivided; i++)
+                        sSelectedTris.insert(oldCount + i);
+                    rebuildModeTools();
                 }
             ));
             y -= SIDE_GAP;
         }
     }
+}
+
+// Delete every triangle currently in sSelectedTris. Indices stay consistent
+// because we filter into a kept-vector rather than erasing in place.
+static void deleteSelectedTriangles() {
+    if (sSelectedTris.empty()) return;
+    pushVMeshUndo();
+    std::vector<PlacedTriangle> kept;
+    kept.reserve(sPlacedTriangles.size() - sSelectedTris.size());
+    for (int i = 0; i < (int)sPlacedTriangles.size(); i++) {
+        if (!sSelectedTris.count(i)) kept.push_back(sPlacedTriangles[i]);
+    }
+    sPlacedTriangles = std::move(kept);
+    sSelectedTris.clear();
+    sHoverTriIndex = -1;
+    rebuildModeTools();
+}
+
+// Builds (or rebuilds) the vector-mode "Selected Vertex" sidebar group.
+// Called on selection change to refresh the X/Y/Z input prefills.
+static void showVectorSelectedTools() {
+    removeUIGroup("vector_selected_tools");
+    if (sSelectedDotIndex < 0 || sSelectedDotIndex >= (int)sPlacedDots.size()) return;
+
+    addUIGroup("vector_selected_tools");
+    glm::vec3 v = sPlacedDots[sSelectedDotIndex];
+    auto fmt = [](float f) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.4f", f);
+        return std::string(buf);
+    };
+
+    // Sit below mode_tools (snap label + snap input use 2 slots after the
+    // dropdown). Add one extra gap of breathing room.
+    float y = SIDE_START_Y - SIDE_GAP * 5;
+
+    UIElement header = createButton("vsel_header",
+        SIDE_BTN_X, y, SIDE_BTN_W, SIDE_BTN_H,
+        {0.0f, 0.0f, 0.0f, 0.0f}, "Selected Vertex", nullptr);
+    addToGroup("vector_selected_tools", header);
+    y -= SIDE_GAP;
+
+    glm::vec4 inputColor = {0.18f, 0.18f, 0.18f, 0.95f};
+    auto addCoord = [&](const std::string& id, const std::string& placeholder, float val) {
+        UIElement input = createTextInput(id,
+            SIDE_BTN_X, y, SIDE_BTN_W, SIDE_BTN_H,
+            inputColor, placeholder, 16);
+        input.inputText = fmt(val);
+        input.numericOnly = true;
+        addToGroup("vector_selected_tools", input);
+        y -= SIDE_GAP;
+    };
+    addCoord("vsel_x", "X", v.x);
+    addCoord("vsel_y", "Y", v.y);
+    addCoord("vsel_z", "Z", v.z);
+
+    addToGroup("vector_selected_tools", createButton("vsel_deselect",
+        SIDE_BTN_X, y, SIDE_BTN_W, SIDE_BTN_H,
+        {0.25f, 0.25f, 0.25f, 0.95f}, "Deselect",
+        []() {
+            sSelectedDotIndex = -1;
+            sCoordEditUndoPushed = false;
+            removeUIGroup("vector_selected_tools");
+        }
+    ));
+}
+
+static void hideVectorSelectedTools() {
+    sSelectedDotIndex = -1;
+    sCoordEditUndoPushed = false;
+    removeUIGroup("vector_selected_tools");
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +755,10 @@ void registerVectorMeshScene() {
             sWasLeftDown = false;
             sVMeshPaused = false;
             sVMeshWasEscDown = false;
+            sSelectedTris.clear();
+            sHoverTriIndex = -1;
+            sSelectedDotIndex = -1;
+            sCoordEditUndoPushed = false;
 
             sReturnSlot = -1;
             sReturnModelName = "";
@@ -662,7 +801,8 @@ void registerVectorMeshScene() {
                     sDrawMode = index;
                     sLineSelectedDots.clear();
                     sPlaneSelectedDots.clear();
-                    sSelectedTriIndex = -1;
+                    sSelectedTris.clear();
+                    hideVectorSelectedTools();
                     rebuildModeTools();
                 },
                 0.0f, -SIDE_GAP
@@ -849,7 +989,8 @@ void registerVectorMeshScene() {
                     sPlacedTriangles = s.triangles;
                     sLineSelectedDots.clear();
                     sPlaneSelectedDots.clear();
-                    sSelectedTriIndex = -1;
+                    sSelectedTris.clear();
+                    hideVectorSelectedTools();
                     sHoverPlacedIndex = -1;
                     sHoverLineIndex = -1;
                     sHoverTriIndex = -1;
@@ -859,6 +1000,38 @@ void registerVectorMeshScene() {
             sVMeshWasCtrlZDown = ctrlZ;
 
             processUIInput();
+
+            // Live coord-edit: parse the X/Y/Z inputs and apply to the
+            // selected vertex. Undo gets one snapshot per focus session.
+            if (sDrawMode == 0 && sSelectedDotIndex >= 0 &&
+                sSelectedDotIndex < (int)sPlacedDots.size()) {
+                auto parseOr = [](const std::string& s, float fallback) {
+                    if (s.empty() || s == "-" || s == "." || s == "-.") return fallback;
+                    try { return std::stof(s); } catch (...) { return fallback; }
+                };
+                glm::vec3 cur = sPlacedDots[sSelectedDotIndex];
+                std::string sx = getInputText("vector_selected_tools", "vsel_x");
+                std::string sy = getInputText("vector_selected_tools", "vsel_y");
+                std::string sz = getInputText("vector_selected_tools", "vsel_z");
+                glm::vec3 next(parseOr(sx, cur.x), parseOr(sy, cur.y), parseOr(sz, cur.z));
+
+                bool anyFocused = false;
+                for (const char* id : {"vsel_x", "vsel_y", "vsel_z"}) {
+                    UIElement* el = getUIElement("vector_selected_tools", id);
+                    if (el && el->focused) { anyFocused = true; break; }
+                }
+                if (!anyFocused) sCoordEditUndoPushed = false;
+
+                if (next != cur) {
+                    if (!sCoordEditUndoPushed) {
+                        pushVMeshUndo();
+                        sCoordEditUndoPushed = true;
+                    }
+                    sPlacedDots[sSelectedDotIndex] = next;
+                }
+            } else {
+                sCoordEditUndoPushed = false;
+            }
 
             if (sVMeshPaused) return;
 
@@ -879,7 +1052,15 @@ void registerVectorMeshScene() {
                     bool dDown = glfwGetKey(ctx.window, GLFW_KEY_D) == GLFW_PRESS;
                     if (dDown && !sWasDDown && ctrlHeld && sHoverPlacedIndex >= 0) {
                         pushVMeshUndo();
-                        sPlacedDots.erase(sPlacedDots.begin() + sHoverPlacedIndex);
+                        int del = sHoverPlacedIndex;
+                        sPlacedDots.erase(sPlacedDots.begin() + del);
+                        // Maintain selected-dot index across the shift.
+                        if (sSelectedDotIndex == del) {
+                            hideVectorSelectedTools();
+                        } else if (sSelectedDotIndex > del) {
+                            sSelectedDotIndex--;
+                            showVectorSelectedTools();
+                        }
                         sHoverPlacedIndex = -1;
                     }
                     sWasDDown = dDown;
@@ -929,15 +1110,30 @@ void registerVectorMeshScene() {
                         }
                     }
 
-                    // Left-click to place dot (skip if one already exists there)
+                    // Left-click handling:
+                    //   - on a placed dot      -> toggle selection (live-edit panel)
+                    //   - on a snapped edge    -> place a new dot
+                    //   - on empty space       -> deselect
                     bool leftDown = glfwGetMouseButton(ctx.window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-                    if (leftDown && !sWasLeftDown && sHoverValid) {
-                        bool exists = false;
-                        for (const auto& d : sPlacedDots)
-                            if (glm::length(d - sHoverPoint) < 0.001f) { exists = true; break; }
-                        if (!exists) {
-                            pushVMeshUndo();
-                            sPlacedDots.push_back(sHoverPoint);
+                    if (leftDown && !sWasLeftDown) {
+                        if (sHoverPlacedIndex >= 0) {
+                            sCoordEditUndoPushed = false;
+                            if (sSelectedDotIndex == sHoverPlacedIndex) {
+                                hideVectorSelectedTools();
+                            } else {
+                                sSelectedDotIndex = sHoverPlacedIndex;
+                                showVectorSelectedTools();
+                            }
+                        } else if (sHoverValid) {
+                            bool exists = false;
+                            for (const auto& d : sPlacedDots)
+                                if (glm::length(d - sHoverPoint) < 0.001f) { exists = true; break; }
+                            if (!exists) {
+                                pushVMeshUndo();
+                                sPlacedDots.push_back(sHoverPoint);
+                            }
+                        } else {
+                            if (sSelectedDotIndex >= 0) hideVectorSelectedTools();
                         }
                     }
                     sWasLeftDown = leftDown;
@@ -1045,15 +1241,32 @@ void registerVectorMeshScene() {
                     // Left-click to select triangle or dots
                     bool leftDown = glfwGetMouseButton(ctx.window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
                     if (leftDown && !sWasLeftDown) {
+                        // Plain click  : replace selection with hovered tri
+                        // Ctrl+click   : toggle hovered tri in/out of selection
+                        // Shift+click  : add hovered tri to selection
+                        // empty click  : clear selection
+                        bool ctrlMod = glfwGetKey(ctx.window, GLFW_KEY_LEFT_CONTROL)  == GLFW_PRESS ||
+                                       glfwGetKey(ctx.window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+                        bool shiftMod = glfwGetKey(ctx.window, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS ||
+                                        glfwGetKey(ctx.window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+
                         if (sHoverTriIndex >= 0 && sHoverPlacedIndex < 0) {
-                            // Select/deselect triangle
-                            int prev = sSelectedTriIndex;
-                            sSelectedTriIndex = (sSelectedTriIndex == sHoverTriIndex) ? -1 : sHoverTriIndex;
-                            if (sSelectedTriIndex != prev) rebuildModeTools();
+                            size_t before = sSelectedTris.size();
+                            if (ctrlMod) {
+                                if (sSelectedTris.count(sHoverTriIndex))
+                                    sSelectedTris.erase(sHoverTriIndex);
+                                else
+                                    sSelectedTris.insert(sHoverTriIndex);
+                            } else if (shiftMod) {
+                                sSelectedTris.insert(sHoverTriIndex);
+                            } else {
+                                sSelectedTris.clear();
+                                sSelectedTris.insert(sHoverTriIndex);
+                            }
+                            if (sSelectedTris.size() != before) rebuildModeTools();
                         } else if (sHoverPlacedIndex < 0 && sHoverTriIndex < 0) {
-                            // Click empty space — deselect triangle
-                            if (sSelectedTriIndex >= 0) {
-                                sSelectedTriIndex = -1;
+                            if (!sSelectedTris.empty()) {
+                                sSelectedTris.clear();
                                 rebuildModeTools();
                             }
                         }
@@ -1104,13 +1317,17 @@ void registerVectorMeshScene() {
                     }
                     sWasADown = aDown;
 
-                    // Ctrl+D to delete hovered triangle
+                    // Ctrl+D: delete the multi-selection if any, else hovered.
                     bool ctrlHeld2 = glfwGetKey(ctx.window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS;
                     bool dDown2 = glfwGetKey(ctx.window, GLFW_KEY_D) == GLFW_PRESS;
-                    if (dDown2 && !sWasDDown && ctrlHeld2 && sHoverTriIndex >= 0) {
-                        pushVMeshUndo();
-                        sPlacedTriangles.erase(sPlacedTriangles.begin() + sHoverTriIndex);
-                        sHoverTriIndex = -1;
+                    if (dDown2 && !sWasDDown && ctrlHeld2) {
+                        if (!sSelectedTris.empty()) {
+                            deleteSelectedTriangles();
+                        } else if (sHoverTriIndex >= 0) {
+                            pushVMeshUndo();
+                            sPlacedTriangles.erase(sPlacedTriangles.begin() + sHoverTriIndex);
+                            sHoverTriIndex = -1;
+                        }
                     }
                     sWasDDown = dDown2;
                 }
@@ -1157,7 +1374,7 @@ void registerVectorMeshScene() {
                     Triangle back = {front.v0, front.v2, front.v1};
 
                     glm::vec3 color(0.8f);
-                    if (i == sSelectedTriIndex)
+                    if (sSelectedTris.count(i))
                         color = glm::vec3(0.5f, 0.7f, 1.0f);
                     else if (i == sHoverTriIndex)
                         color = glm::vec3(1.0f, 0.5f, 0.0f);
@@ -1188,7 +1405,9 @@ void registerVectorMeshScene() {
                         for (int s : sPlaneSelectedDots)
                             if (s == i) { selected = true; break; }
 
-                    if (selected)
+                    if (sDrawMode == 0 && i == sSelectedDotIndex)
+                        drawDot(sPlacedDots[i], 0.06f, {1.0f, 0.2f, 1.0f});
+                    else if (selected)
                         drawDot(sPlacedDots[i], 0.05f, {0.0f, 0.5f, 1.0f});
                     else if (i == sHoverPlacedIndex)
                         drawDot(sPlacedDots[i], 0.05f, {1.0f, 0.5f, 0.0f});
@@ -1279,7 +1498,8 @@ void registerVectorMeshScene() {
         for (int i = 0; i < n; i++)
             if (!toDelete.count(i)) kept.push_back(sPlacedTriangles[i]);
         sPlacedTriangles = std::move(kept);
-        if (sSelectedTriIndex >= 0 && toDelete.count(sSelectedTriIndex)) sSelectedTriIndex = -1;
+        // Indices shifted; safest to drop the manual selection.
+        sSelectedTris.clear();
         return AI::Json{{"deleted", (int)toDelete.size()}};
     });
 
@@ -1336,7 +1556,7 @@ void registerVectorMeshScene() {
             if (!toDelete.count(i)) keptDots.push_back(sPlacedDots[i]);
         sPlacedDots = std::move(keptDots);
 
-        sSelectedTriIndex = -1;
+        sSelectedTris.clear();
         return AI::Json{
             {"deleted_vertices", (int)toDelete.size()},
             {"deleted_triangles", trisDropped}
@@ -1356,38 +1576,8 @@ void registerVectorMeshScene() {
             indices.push_back(i);
         }
         if (indices.empty()) return AI::Json{{"subdivided", 0}};
-        // Deduplicate and sort descending so replacement-in-place stays stable.
-        std::sort(indices.begin(), indices.end(), std::greater<int>());
-        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
-
         pushVMeshUndo();
-
-        // Reuse an existing vertex if one sits on top of the computed midpoint.
-        auto findOrAddVert = [](const glm::vec3& p) -> int {
-            const float eps = 1e-4f;
-            for (int i = 0; i < (int)sPlacedDots.size(); i++) {
-                if (glm::distance(sPlacedDots[i], p) < eps) return i;
-            }
-            sPlacedDots.push_back(p);
-            return (int)sPlacedDots.size() - 1;
-        };
-
-        int subdivided = 0;
-        for (int idx : indices) {
-            PlacedTriangle t = sPlacedTriangles[idx];
-            glm::vec3 A = sPlacedDots[t.dotA];
-            glm::vec3 B = sPlacedDots[t.dotB];
-            glm::vec3 C = sPlacedDots[t.dotC];
-            int abIdx = findOrAddVert((A + B) * 0.5f);
-            int bcIdx = findOrAddVert((B + C) * 0.5f);
-            int caIdx = findOrAddVert((C + A) * 0.5f);
-            // Replace original with corner-aIdx-abIdx-caIdx, append the rest.
-            sPlacedTriangles[idx] = {t.dotA, abIdx, caIdx, t.flipped};
-            sPlacedTriangles.push_back({abIdx, t.dotB, bcIdx, t.flipped});
-            sPlacedTriangles.push_back({caIdx, bcIdx, t.dotC, t.flipped});
-            sPlacedTriangles.push_back({abIdx, bcIdx, caIdx, t.flipped});
-            subdivided++;
-        }
+        int subdivided = subdivideTriangleIndices(std::move(indices));
         return AI::Json{{"subdivided", subdivided}};
     });
 

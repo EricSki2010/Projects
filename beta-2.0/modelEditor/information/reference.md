@@ -82,9 +82,9 @@ Editor for creating custom meshes from dots, lines, and triangles.
 **Entry:** Receives `VectorMeshEditData` with meshName, slotIndex, modelName.
 
 #### Modes
-- **Vector (dot) mode**: Place 3D points with snap-to-edge. Snaps to cube corners, existing dots, and interpolated points along edges/lines. Snap count configurable.
+- **Vector (dot) mode**: Place 3D points with snap-to-edge. Snaps to cube corners, existing dots, and interpolated points along edges/lines. Snap count configurable. Clicking a placed dot selects it (magenta highlight) and opens a "Selected Vertex" panel in the right sidebar with live-editable X/Y/Z text inputs (`numericOnly`, prefilled with current coords). Each frame the inputs are parsed and written back to `sPlacedDots[sSelectedDotIndex]`; one undo snapshot per focus session. Index-based references in lines/triangles follow the move automatically. Ctrl+D on the *selected* dot clears the selection; on a *different* dot, the selection's index is remapped across the shift.
 - **Line mode**: Select 2 dots → Ctrl+A to create edge. Ctrl+D to delete hovered line.
-- **Plane mode**: Select 3 dots → Ctrl+A to create triangle. Click triangle to select. "Flip Normal" button on selected triangle. Ctrl+D to delete.
+- **Plane mode**: Select 3 dots → Ctrl+A to create triangle. Triangle multi-select: plain click replaces, Ctrl+click toggles, Shift+click adds, click empty space clears. "Flip Normal(s)" and "Subdivide" buttons act on the whole selection (label includes count when >1). Subdivide replaces each selected tri with 4 children (midpoint-vertex sharing via `subdivideTriangleIndices`, AI tool `sd` calls the same helper); originals stay at their old index, 3 new appended each, and the new children are added to the selection. Ctrl+D deletes the selection if non-empty, else the hovered triangle.
 
 #### Triangle Preview
 - Triangles render with the winding order as placed (A→B→C). No auto
@@ -100,7 +100,7 @@ Editor for creating custom meshes from dots, lines, and triangles.
   - This data feeds directly into `RegisteredMesh.triFaceDir` / `faceState` so custom shapes participate in face-pair culling like prefab cubes.
 
 #### Pause Menu
-- "Continue", "Save Model" (saves .vmesh + exports .mesh), "Exit" (returns to 3dModeler or menu).
+- "Continue", "Save & Exit" (saves .vmesh + exports .mesh + returns to 3dModeler or menu in one button).
 
 #### Shortcuts
 - Ctrl+Z: Undo (50-step history across dots, lines, triangles, flips)

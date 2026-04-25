@@ -28,6 +28,11 @@ struct UIElement {
     // Multi-line: text wraps within the input's width, and the element's
     // size.y is expected to be resized by the caller to fit the line count.
     bool multiline = false;
+    // When true, the text input only accepts digits, '.', and '-'.
+    bool numericOnly = false;
+    // Caret position within inputText (0..inputText.size()). Snapped to end
+    // on focus; moved by Left/Right arrows; insertions/deletions happen here.
+    int caretPos = 0;
 
     // When true, width is adjusted by aspect ratio so equal w/h values render as a square
     bool aspectCorrected = false;
