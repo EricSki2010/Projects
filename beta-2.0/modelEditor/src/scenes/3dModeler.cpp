@@ -55,6 +55,7 @@ static float sSideBtnW = 0, sSideBtnH = 0, sSideBtnX = 0, sSidePad = 0;
 static float sPreviewAngle = 0.0f;
 static double sLastPreviewTime = 0.0;
 static int sEditorMode = 0; // 0 = Build, 1 = Paint
+static bool sSoftEdges = true; // viewer-only MSAA toggle
 static bool sColorEditOpen = false;
 static glm::vec3 sPreEditColor{0.6f, 0.6f, 0.6f}; // snapshot taken when color edit panel opens, used by Cancel
 static int sColorMode = 0; // 0 = RGB, 1 = Hex, 2 = Color Wheel
@@ -1121,6 +1122,31 @@ void register3dModelerScene() {
                 };
                 rebuildActionButton();
                 sRebuildActionButton = rebuildActionButton;
+            }
+            y -= btnH + panelPad;
+
+            // Soft Edges toggle (MSAA). Viewer-only — not saved with the model.
+            if (sSoftEdges) glEnable(GL_MULTISAMPLE);
+            else            glDisable(GL_MULTISAMPLE);
+            {
+                glm::vec4 onColor  = {0.25f, 0.35f, 0.25f, 0.95f};
+                glm::vec4 offColor = {0.18f, 0.18f, 0.18f, 0.95f};
+                std::string label = sSoftEdges ? "Soft Edges: On" : "Soft Edges: Off";
+                auto btn = createButton("soft_edges_toggle",
+                    btnX, y, btnW, btnH,
+                    sSoftEdges ? onColor : offColor,
+                    label,
+                    [onColor, offColor]() {
+                        sSoftEdges = !sSoftEdges;
+                        if (sSoftEdges) glEnable(GL_MULTISAMPLE);
+                        else            glDisable(GL_MULTISAMPLE);
+                        UIElement* el = getUIElement("sidebar", "soft_edges_toggle");
+                        if (el) {
+                            el->label = sSoftEdges ? "Soft Edges: On" : "Soft Edges: Off";
+                            el->color = sSoftEdges ? onColor : offColor;
+                        }
+                    });
+                addToGroup("sidebar", btn);
             }
             y -= btnH + panelPad;
 
