@@ -44,8 +44,9 @@ std::vector<MergedMeshEntry> buildMergedMeshes();  // CHUNK mode: face culling +
 std::vector<MergedMeshEntry> buildSingleMeshes();  // SINGLE mode: full meshes, no culling
 void clearMeshData();
 const RegisteredMesh* getRegisteredMesh(const char* name);
-void setPaintPalette(const glm::vec3 palette[16]);
+void setPaintPalette(const glm::vec3* palette, int count);
 const glm::vec3* getPaintPalette();
+int getPaintPaletteCount();
 // Register mesh with interleaved indices: v0,v1,v2,faceDir, ...
 // faceDir: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z, 0xFFFFFFFF=none
 // faceStates: per-face cull state [6], 0=open, 1=partial, 2=solid (nullptr = all 0)

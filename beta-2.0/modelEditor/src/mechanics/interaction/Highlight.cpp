@@ -308,13 +308,13 @@ void renderHoverHighlight() {
     // Ctrl+A in paint mode: color selected faces
     if (aDown && !sWasADown && ctrlHeld && !getSelection().empty() && !isForceRectangularRaycast()) {
         int colorIdx = getSelectedPaintColor();
-        if (colorIdx >= 0 && colorIdx < 16) {
+        if (colorIdx >= 0) {
             pushUndoSnapshot();
             for (const auto& sel : getSelection()) {
                 BlockCollider* col = const_cast<BlockCollider*>(
                     getColliderAt(sel.blockPos.x, sel.blockPos.y, sel.blockPos.z));
                 if (col && sel.faceIndex >= 0 && sel.faceIndex < (int)col->triColors.size())
-                    col->triColors[sel.faceIndex] = (int8_t)colorIdx;
+                    col->triColors[sel.faceIndex] = (int16_t)colorIdx;
             }
             clearSelection();
             ctx.needsRebuild = true;

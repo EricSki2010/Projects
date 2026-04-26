@@ -60,14 +60,16 @@ static glm::vec3 sPreEditColor{0.6f, 0.6f, 0.6f}; // snapshot taken when color e
 static int sColorMode = 0; // 0 = RGB, 1 = Hex, 2 = Color Wheel
 static std::function<void()> sRebuildColorInputs;
 static std::function<void()> sRebuildActionButton;
-static int sSelectedColor = 0; // which color wheel slice is selected
-static int sHoveredColor = -1; // slice under cursor, -1 if none
-static glm::vec3 sColorWheel[16] = {
-    {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f},
-    {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f},
-    {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f},
-    {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f},
-};
+// Paint palette is variable-size; one pack = 16 colors. sSelectedColor is a
+// GLOBAL index into sColorWheel (pack*16 + slotInPack). The wheel UI shows the
+// 16 slices for sPaintPage at a time. Selecting/scrolling stays within the
+// current pack; switching packs is done via the dropdown above the wheel.
+static int sSelectedColor = 0;             // global slot index
+static int sHoveredColor = -1;             // global slot index, -1 if none
+static int sPaintPage = 0;                 // currently visible paint pack
+static int sPaintPageCount = 1;            // total paint packs (>= 1)
+static const int COLORS_PER_PAINT_PACK = 16;
+static std::vector<glm::vec3> sColorWheel = std::vector<glm::vec3>(COLORS_PER_PAINT_PACK, glm::vec3(0.6f, 0.6f, 0.6f));
 
 // Undo snapshot: captures placements + palette state
 struct UndoSnapshot {
@@ -75,10 +77,11 @@ struct UndoSnapshot {
         glm::ivec3 pos;
         glm::vec3 rotation;
         std::string meshName;
-        std::vector<int8_t> triColors;
+        std::vector<int16_t> triColors;
     };
     std::vector<Entry> placements;
-    glm::vec3 palette[16];
+    std::vector<glm::vec3> palette;
+    int paintPageCount = 1;
 };
 static std::vector<UndoSnapshot> sUndoStack;
 static const int kMaxUndoSteps = 50;
@@ -95,8 +98,8 @@ static UndoSnapshot captureSnapshot() {
         e.triColors = col.triColors;
         s.placements.push_back(e);
     }
-    for (int i = 0; i < 16; i++)
-        s.palette[i] = sColorWheel[i];
+    s.palette = sColorWheel;
+    s.paintPageCount = sPaintPageCount;
     return s;
 }
 
@@ -106,17 +109,24 @@ static void pushUndo() {
         sUndoStack.erase(sUndoStack.begin());
 }
 
+static void rebuildPaintPackDropdown();
+
 static void restoreSnapshot(const UndoSnapshot& s) {
     VE::clearDraws();
-    for (int i = 0; i < 16; i++)
-        sColorWheel[i] = s.palette[i];
-    setPaintPalette(sColorWheel);
+    sColorWheel = s.palette;
+    int newPackCount = (int)sColorWheel.size() / COLORS_PER_PAINT_PACK;
+    if (newPackCount < 1) newPackCount = 1;
+    sPaintPageCount = newPackCount;
+    if (sPaintPage >= sPaintPageCount) sPaintPage = sPaintPageCount - 1;
+    if (sSelectedColor >= (int)sColorWheel.size()) sSelectedColor = 0;
+    setPaintPalette(sColorWheel.data(), (int)sColorWheel.size());
     for (const auto& e : s.placements) {
         VE::draw(e.meshName.c_str(), (float)e.pos.x, (float)e.pos.y, (float)e.pos.z,
                  e.rotation.x, e.rotation.y, e.rotation.z);
         BlockCollider* col = const_cast<BlockCollider*>(getColliderAt(e.pos.x, e.pos.y, e.pos.z));
         if (col) col->triColors = e.triColors;
     }
+    rebuildPaintPackDropdown();
     ctx.needsRebuild = true;
 }
 
@@ -195,10 +205,19 @@ static void drawColorWheel(Shader* uiShader) {
 
     glBindVertexArray(sWheelVAO);
 
+    // The wheel shows the active paint pack's 16 slices. Local slot index is
+    // 0..15; global = sPaintPage*16 + local.
+    int packBase = sPaintPage * COLORS_PER_PAINT_PACK;
+    int localSelected = (sSelectedColor >= packBase && sSelectedColor < packBase + COLORS_PER_PAINT_PACK)
+        ? (sSelectedColor - packBase) : -1;
+    int localHovered = (sHoveredColor >= packBase && sHoveredColor < packBase + COLORS_PER_PAINT_PACK)
+        ? (sHoveredColor - packBase) : -1;
+
     // Draw each triangle slice
     for (int i = 0; i < 16; i++) {
-        glm::vec3 c = sColorWheel[i];
-        float alpha = (i == sSelectedColor) ? 1.0f : 0.8f;
+        int gi = packBase + i;
+        glm::vec3 c = (gi < (int)sColorWheel.size()) ? sColorWheel[gi] : glm::vec3(0.6f);
+        float alpha = (i == localSelected) ? 1.0f : 0.8f;
         glUniform4f(uiShader->loc("uColor"), c.r, c.g, c.b, alpha);
         glDrawArrays(GL_TRIANGLES, i * 3, 3);
     }
@@ -206,24 +225,25 @@ static void drawColorWheel(Shader* uiShader) {
     // Draw black outlines first
     glLineWidth(2.0f);
     for (int i = 0; i < 16; i++) {
-        if (i == sSelectedColor) continue;
+        if (i == localSelected) continue;
         glUniform4f(uiShader->loc("uColor"), 0.0f, 0.0f, 0.0f, 1.0f);
         glDrawArrays(GL_LINE_LOOP, i * 3, 3);
     }
     // Hovered (non-selected) slice gets a thick grey outline.
-    if (sHoveredColor >= 0 && sHoveredColor < 16 && sHoveredColor != sSelectedColor) {
+    if (localHovered >= 0 && localHovered != localSelected) {
         glLineWidth(3.0f);
         glUniform4f(uiShader->loc("uColor"), 0.7f, 0.7f, 0.7f, 1.0f);
-        glDrawArrays(GL_LINE_LOOP, sHoveredColor * 3, 3);
+        glDrawArrays(GL_LINE_LOOP, localHovered * 3, 3);
     }
     // Draw selected slice and outline on top
-    if (sSelectedColor >= 0 && sSelectedColor < 16) {
-        glm::vec3 c = sColorWheel[sSelectedColor];
+    if (localSelected >= 0) {
+        int gi = packBase + localSelected;
+        glm::vec3 c = (gi < (int)sColorWheel.size()) ? sColorWheel[gi] : glm::vec3(0.6f);
         glUniform4f(uiShader->loc("uColor"), c.r, c.g, c.b, 1.0f);
-        glDrawArrays(GL_TRIANGLES, sSelectedColor * 3, 3);
+        glDrawArrays(GL_TRIANGLES, localSelected * 3, 3);
         glLineWidth(3.0f);
         glUniform4f(uiShader->loc("uColor"), 1.0f, 1.0f, 0.0f, 1.0f);
-        glDrawArrays(GL_LINE_LOOP, sSelectedColor * 3, 3);
+        glDrawArrays(GL_LINE_LOOP, localSelected * 3, 3);
     }
     glLineWidth(1.0f);
 
@@ -418,6 +438,112 @@ static void rebuildPackDropdown() {
                    0.0f, optStep);
 }
 
+// ── Paint pack management ──────────────────────────────────────────
+// Mirrors the vectorMesh model pack pattern but per-model: each pack is 16
+// palette entries and lives inside ModelFile::palette (saved with the model).
+// sSelectedColor is a global slot index (pack*16 + slot), so triangles painted
+// in any pack keep their color when the user flips the wheel to a different
+// pack.
+
+static void addPaintPack() {
+    sColorWheel.insert(sColorWheel.end(), COLORS_PER_PAINT_PACK, glm::vec3(0.6f));
+    sPaintPageCount++;
+    setPaintPalette(sColorWheel.data(), (int)sColorWheel.size());
+}
+
+// Removes one pack of 16 colors and remaps any triangle whose color landed in
+// the deleted pack to "unpainted". Triangles in higher packs shift down.
+static void deletePaintPack(int packIdx) {
+    if (packIdx < 0 || packIdx >= sPaintPageCount || sPaintPageCount <= 1) return;
+    int base = packIdx * COLORS_PER_PAINT_PACK;
+    sColorWheel.erase(sColorWheel.begin() + base,
+                      sColorWheel.begin() + base + COLORS_PER_PAINT_PACK);
+    sPaintPageCount--;
+
+    // Remap every painted triangle in the live colliders.
+    auto remap = [&](int16_t idx) -> int16_t {
+        if (idx < 0) return -1;
+        if (idx >= base && idx < base + COLORS_PER_PAINT_PACK) return -1;
+        if (idx >= base + COLORS_PER_PAINT_PACK) return idx - COLORS_PER_PAINT_PACK;
+        return idx;
+    };
+    for (auto& col : const_cast<std::vector<BlockCollider>&>(getAllColliders()))
+        for (auto& c : col.triColors) c = remap(c);
+
+    // Also remap any pending undo snapshots so a later undo doesn't restore
+    // indices that point past the now-shorter palette.
+    for (auto& snap : sUndoStack) {
+        for (auto& e : snap.placements)
+            for (auto& c : e.triColors) c = remap(c);
+        if ((int)snap.palette.size() > base + COLORS_PER_PAINT_PACK)
+            snap.palette.erase(snap.palette.begin() + base,
+                               snap.palette.begin() + base + COLORS_PER_PAINT_PACK);
+        if (snap.paintPageCount > 1) snap.paintPageCount--;
+    }
+
+    if (sPaintPage >= sPaintPageCount) sPaintPage = sPaintPageCount - 1;
+    sSelectedColor = remap((int16_t)sSelectedColor);
+    if (sSelectedColor < 0) sSelectedColor = sPaintPage * COLORS_PER_PAINT_PACK;
+    setPaintPalette(sColorWheel.data(), (int)sColorWheel.size());
+    ctx.needsRebuild = true;
+}
+
+static void rebuildPaintPackDropdown() {
+    removeFromGroup("sidebar", "paint_pack_select");
+    removeUIGroup("paint_pack_select_dropdown");
+    if (sEditorMode != 1) return;
+
+    // The model pack dropdown anchors right above the grid. In Paint mode the
+    // color wheel covers that region (panel + wheel are both bottom-right), so
+    // lift the paint pack dropdown clear of the wheel's top.
+    float y = sGridY + sGridCellH + sSideBtnH + 0.04f;
+    glm::vec4 color = {0.3f, 0.25f, 0.3f, 0.95f};
+
+    std::vector<std::string> options;
+    options.reserve(sPaintPageCount + 2);
+    for (int p = 0; p < sPaintPageCount; p++) {
+        int lo = p * COLORS_PER_PAINT_PACK + 1;
+        int hi = (p + 1) * COLORS_PER_PAINT_PACK;
+        options.push_back("Paint Pack " + std::to_string(p + 1) +
+                          " (" + std::to_string(lo) + "-" + std::to_string(hi) + ")");
+    }
+    options.push_back("+ Add Paint Pack");
+    bool canDelete = sPaintPageCount > 1;
+    if (canDelete)
+        options.push_back("x Delete Pack " + std::to_string(sPaintPage + 1));
+
+    int lo = sPaintPage * COLORS_PER_PAINT_PACK + 1;
+    int hi = (sPaintPage + 1) * COLORS_PER_PAINT_PACK;
+    std::string label = "Paint Pack " + std::to_string(sPaintPage + 1) +
+                        " (" + std::to_string(lo) + "-" + std::to_string(hi) + ")";
+
+    float optStep = sSideBtnH + 0.01f;
+    int addIdx = sPaintPageCount;
+    int delIdx = canDelete ? (sPaintPageCount + 1) : -1;
+    createDropdown("sidebar", "paint_pack_select",
+                   sSideBtnX, y, sSideBtnW, sSideBtnH,
+                   color, label, options,
+                   [addIdx, delIdx](int idx, const std::string& /*optLabel*/) {
+                       if (idx == addIdx) {
+                           addPaintPack();
+                           sPaintPage = sPaintPageCount - 1;
+                           // Move selection to the new pack so edits target it.
+                           sSelectedColor = sPaintPage * COLORS_PER_PAINT_PACK;
+                       } else if (idx == delIdx) {
+                           deletePaintPack(sPaintPage);
+                       } else {
+                           sPaintPage = idx;
+                           // Keep selection on the same local slot in the new pack
+                           // so scroll/click feel continuous.
+                           int local = sSelectedColor % COLORS_PER_PAINT_PACK;
+                           if (local < 0) local = 0;
+                           sSelectedColor = sPaintPage * COLORS_PER_PAINT_PACK + local;
+                       }
+                       rebuildPaintPackDropdown();
+                   },
+                   0.0f, optStep);
+}
+
 static int ensureBlockType(const std::string& meshName) {
     // Find existing type
     for (int i = 0; i < (int)sCurrentModel.blockTypes.size(); i++)
@@ -448,9 +574,8 @@ void pushUndoSnapshot() {
 }
 
 static void saveCurrentModel() {
-    // Save palette
-    for (int i = 0; i < 16; i++)
-        sCurrentModel.palette[i] = sColorWheel[i];
+    // Save palette (variable size; one pack = 16 colors)
+    sCurrentModel.palette = sColorWheel;
 
     // Rebuild placements from current colliders
     sCurrentModel.placements.clear();
@@ -591,7 +716,7 @@ void register3dModelerScene() {
             VE::setGradientBackground(true);
             initOverlay();
             initColorWheel();
-            setPaintPalette(sColorWheel);
+            setPaintPalette(sColorWheel.data(), (int)sColorWheel.size());
 
             // Register cube mesh for ghost block collider
             VE::MeshDef cubeDef;
@@ -782,6 +907,7 @@ void register3dModelerScene() {
 
             rebuildSelectorIcons();
             rebuildPackDropdown();
+            rebuildPaintPackDropdown();
 
             // Action button (changes based on editor mode)
             {
@@ -840,7 +966,7 @@ void register3dModelerScene() {
 
                                 if (sColorEditOpen) {
                                     // Snapshot current color so Cancel can revert
-                                    if (sSelectedColor >= 0 && sSelectedColor < 16)
+                                    if (sSelectedColor >= 0 && sSelectedColor < (int)sColorWheel.size())
                                         sPreEditColor = sColorWheel[sSelectedColor];
 
                                     UIElement* actionBtn = getUIElement("sidebar", "action_btn");
@@ -889,7 +1015,7 @@ void register3dModelerScene() {
                                         float y = fieldsY;
                                         glm::vec4 inputColor = {0.2f, 0.2f, 0.2f, 0.95f};
 
-                                        glm::vec3 cur = (sSelectedColor >= 0 && sSelectedColor < 16)
+                                        glm::vec3 cur = (sSelectedColor >= 0 && sSelectedColor < (int)sColorWheel.size())
                                             ? sColorWheel[sSelectedColor] : glm::vec3(0.6f);
                                         bool isDefault = (cur == glm::vec3(0.6f));
                                         float maxC = std::max({cur.r, cur.g, cur.b, 0.001f});
@@ -968,10 +1094,10 @@ void register3dModelerScene() {
                                                     bri = brS.empty() ? 1.0f : std::clamp(std::stof(brS) / 255.0f, 0.0f, 1.0f);
                                                 }
 
-                                                if (sSelectedColor >= 0 && sSelectedColor < 16)
+                                                if (sSelectedColor >= 0 && sSelectedColor < (int)sColorWheel.size())
                                                     sColorWheel[sSelectedColor] = glm::vec3(r, g, b) * bri;
 
-                                                setPaintPalette(sColorWheel);
+                                                setPaintPalette(sColorWheel.data(), (int)sColorWheel.size());
                                                 ctx.needsRebuild = true;
                                                 closeColorEdit();
                                             }
@@ -982,9 +1108,9 @@ void register3dModelerScene() {
                                     buildInputs();
                                 } else {
                                     // Cancel: revert color to snapshot taken when panel opened
-                                    if (sSelectedColor >= 0 && sSelectedColor < 16) {
+                                    if (sSelectedColor >= 0 && sSelectedColor < (int)sColorWheel.size()) {
                                         sColorWheel[sSelectedColor] = sPreEditColor;
-                                        setPaintPalette(sColorWheel);
+                                        setPaintPalette(sColorWheel.data(), (int)sColorWheel.size());
                                         ctx.needsRebuild = true;
                                     }
                                     closeColorEdit();
@@ -1009,6 +1135,7 @@ void register3dModelerScene() {
                     clearSelection();
                     rebuildSelectorIcons();
                     rebuildPackDropdown();
+                    rebuildPaintPackDropdown();
                     if (sRebuildActionButton) sRebuildActionButton();
                     if (sEditorMode == 1 && sSelectedColor < 0)
                         sSelectedColor = 0;
@@ -1024,10 +1151,20 @@ void register3dModelerScene() {
                 setMemoryPath("assets/saves/3dModels");
                 sUndoStack.clear();
                 if (loadModel(sModelName, sCurrentModel)) {
-                    // Restore palette
-                    for (int i = 0; i < 16; i++)
-                        sColorWheel[i] = sCurrentModel.palette[i];
-                    setPaintPalette(sColorWheel);
+                    // Restore palette (variable size; one pack = 16 colors).
+                    // Round up to a multiple of 16 in case a future writer left
+                    // a partial pack on disk.
+                    sColorWheel = sCurrentModel.palette;
+                    if (sColorWheel.empty())
+                        sColorWheel.assign(COLORS_PER_PAINT_PACK, glm::vec3(0.6f));
+                    int rem = (int)sColorWheel.size() % COLORS_PER_PAINT_PACK;
+                    if (rem != 0)
+                        sColorWheel.resize(sColorWheel.size() + (COLORS_PER_PAINT_PACK - rem), glm::vec3(0.6f));
+                    sPaintPageCount = (int)sColorWheel.size() / COLORS_PER_PAINT_PACK;
+                    if (sPaintPage >= sPaintPageCount) sPaintPage = sPaintPageCount - 1;
+                    if (sSelectedColor >= (int)sColorWheel.size()) sSelectedColor = 0;
+                    setPaintPalette(sColorWheel.data(), (int)sColorWheel.size());
+                    rebuildPaintPackDropdown();
 
                     for (int i = 0; i < (int)sCurrentModel.blockTypes.size(); i++) {
                         const BlockTypeDef& bt = sCurrentModel.blockTypes[i];
@@ -1225,9 +1362,14 @@ void register3dModelerScene() {
             }
 
             // Scroll: build mode = cycle slots, paint mode = cycle colors
+            // (within the current paint pack only).
             if (ctx.scrollDelta != 0.0f && sEditorMode == 1) {
                 int dir = (ctx.scrollDelta > 0.0f) ? 1 : -1;
-                sSelectedColor = (sSelectedColor + dir + 16) % 16;
+                int packBase = sPaintPage * COLORS_PER_PAINT_PACK;
+                int local = sSelectedColor - packBase;
+                if (local < 0 || local >= COLORS_PER_PAINT_PACK) local = 0;
+                local = (local + dir + COLORS_PER_PAINT_PACK) % COLORS_PER_PAINT_PACK;
+                sSelectedColor = packBase + local;
             }
             if (ctx.scrollDelta != 0.0f && sEditorMode == 0) {
                 int total = (int)sSlotMesh.size();
@@ -1353,13 +1495,17 @@ void register3dModelerScene() {
             }
 
             // Color wheel hover + click (paint mode). Wheel is raw GL so
-            // interactions live here, not in the UI manager.
+            // interactions live here, not in the UI manager. Wheel slice
+            // indices are LOCAL (0..15); we map to global by adding the
+            // active pack base.
             sHoveredColor = -1;
             if (sEditorMode == 1) {
                 double mx, my;
                 glfwGetCursorPos(ctx.window, &mx, &my);
                 if (!isPointOverUI(mx, my, ctx.width, ctx.height)) {
-                    sHoveredColor = wheelSliceAtCursor();
+                    int local = wheelSliceAtCursor();
+                    if (local >= 0)
+                        sHoveredColor = sPaintPage * COLORS_PER_PAINT_PACK + local;
                 }
                 bool leftDown = glfwGetMouseButton(ctx.window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
                 if (leftDown && !sWasLeftDown && sHoveredColor >= 0) {
@@ -1476,20 +1622,22 @@ void register3dModelerScene() {
     AI::registerTool("set_palette_color", [require3dModeler](const AI::Json& a) -> AI::Json {
         require3dModeler();
         int slot = a.at("slot").get<int>();
-        if (slot < 0 || slot >= 16) throw std::runtime_error("slot must be 0..15");
+        int total = (int)sColorWheel.size();
+        if (slot < 0 || slot >= total)
+            throw std::runtime_error("slot must be 0.." + std::to_string(total - 1));
         float r = a.at("r").get<float>();
         float g = a.at("g").get<float>();
         float b = a.at("b").get<float>();
         pushUndo();
         sColorWheel[slot] = glm::vec3(r, g, b);
-        setPaintPalette(sColorWheel);
+        setPaintPalette(sColorWheel.data(), (int)sColorWheel.size());
         return AI::Json{{"slot", slot}, {"r", r}, {"g", g}, {"b", b}};
     });
 
     AI::registerTool("get_palette", [require3dModeler](const AI::Json&) -> AI::Json {
         require3dModeler();
         AI::Json arr = AI::Json::array();
-        for (int i = 0; i < 16; i++) {
+        for (size_t i = 0; i < sColorWheel.size(); i++) {
             arr.push_back({sColorWheel[i].r, sColorWheel[i].g, sColorWheel[i].b});
         }
         return arr;
@@ -1498,8 +1646,11 @@ void register3dModelerScene() {
     AI::registerTool("select_color_slot", [require3dModeler](const AI::Json& a) -> AI::Json {
         require3dModeler();
         int slot = a.at("slot").get<int>();
-        if (slot < 0 || slot >= 16) throw std::runtime_error("slot must be 0..15");
+        int total = (int)sColorWheel.size();
+        if (slot < 0 || slot >= total)
+            throw std::runtime_error("slot must be 0.." + std::to_string(total - 1));
         sSelectedColor = slot;
+        sPaintPage = slot / COLORS_PER_PAINT_PACK;
         return AI::Json{{"selected", slot}};
     });
 

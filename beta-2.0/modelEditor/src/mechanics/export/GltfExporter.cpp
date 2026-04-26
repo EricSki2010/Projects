@@ -256,17 +256,17 @@ static int greedyMeshPlane(VertexColorPrim& prim, int faceDir, int planeIntCoord
 bool exportModelToGlb(const std::string& outPath) {
     const auto& colliders = getAllColliders();
     const glm::vec3* palette = getPaintPalette();
+    int paletteCount = getPaintPaletteCount();
 
     // Shared face-pair cull set — same logic the editor renderer uses.
     FaceCullSet cullSet = computeFaceCullSet();
 
     VertexColorPrim prim;
 
-    // Palette is fixed at 16 entries (see setPaintPalette). Guard both ends
-    // so a corrupt triColors entry or a stray non-rectangular triangle index
-    // can't walk past the buffer.
+    // Guard both ends so a corrupt triColors entry or a stray non-rectangular
+    // triangle index can't walk past the buffer.
     auto colorForIndex = [&](int paletteIndex) -> glm::vec3 {
-        if (!palette || paletteIndex < 0 || paletteIndex >= 16) return kUnpaintedColor;
+        if (!palette || paletteIndex < 0 || paletteIndex >= paletteCount) return kUnpaintedColor;
         return palette[paletteIndex];
     };
 

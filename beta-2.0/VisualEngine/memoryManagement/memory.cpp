@@ -266,8 +266,10 @@ bool saveModel(const std::string& name, const ModelFile& model) {
     }
 
     // Magic + version
+    // v4: triColors are int16_t (was int8_t in v3), palette is variable-size
+    //     (u32 count + count*vec3) so multi-pack paint palettes can persist.
     out.write("MDL", 3);
-    uint8_t version = 3;
+    uint8_t version = 4;
     out.write(reinterpret_cast<const char*>(&version), 1);
 
     // Block types section
@@ -311,15 +313,19 @@ bool saveModel(const std::string& name, const ModelFile& model) {
         writeU32(out, (uint32_t)p.ry);
         writeU32(out, (uint32_t)p.rz);
         writeU32(out, (uint32_t)p.triColors.size());
-        for (int8_t c : p.triColors)
-            out.write(reinterpret_cast<const char*>(&c), 1);
+        for (int16_t c : p.triColors)
+            out.write(reinterpret_cast<const char*>(&c), 2);
     }
 
-    // Palette (v3+)
-    for (int i = 0; i < 16; i++) {
-        writeF32(out, model.palette[i].r);
-        writeF32(out, model.palette[i].g);
-        writeF32(out, model.palette[i].b);
+    // Palette (v4: variable size, multiple of 16)
+    uint32_t paletteCount = (uint32_t)model.palette.size();
+    if (paletteCount == 0) paletteCount = 16;
+    writeU32(out, paletteCount);
+    for (uint32_t i = 0; i < paletteCount; i++) {
+        glm::vec3 c = (i < model.palette.size()) ? model.palette[i] : glm::vec3(0.6f);
+        writeF32(out, c.r);
+        writeF32(out, c.g);
+        writeF32(out, c.b);
     }
 
     return true;
@@ -383,16 +389,39 @@ bool loadModel(const std::string& name, ModelFile& model) {
         p.rx = (int)readU32(in);
         p.ry = (int)readU32(in);
         p.rz = (int)readU32(in);
-        if (version >= 3) {
+        if (version >= 4) {
             uint32_t triColorCount = readU32(in);
             p.triColors.resize(triColorCount);
-            for (uint32_t j = 0; j < triColorCount; j++)
-                in.read(reinterpret_cast<char*>(&p.triColors[j]), 1);
+            for (uint32_t j = 0; j < triColorCount; j++) {
+                int16_t v = 0;
+                in.read(reinterpret_cast<char*>(&v), 2);
+                p.triColors[j] = v;
+            }
+        } else if (version >= 3) {
+            // v3 wrote int8_t; sign-extend into the new int16_t storage.
+            uint32_t triColorCount = readU32(in);
+            p.triColors.resize(triColorCount);
+            for (uint32_t j = 0; j < triColorCount; j++) {
+                int8_t v = 0;
+                in.read(reinterpret_cast<char*>(&v), 1);
+                p.triColors[j] = (int16_t)v;
+            }
         }
     }
 
-    // Palette (v3+)
-    if (version >= 3) {
+    // Palette
+    if (version >= 4) {
+        uint32_t paletteCount = readU32(in);
+        if (paletteCount == 0) paletteCount = 16;
+        model.palette.resize(paletteCount);
+        for (uint32_t i = 0; i < paletteCount; i++) {
+            model.palette[i].r = readF32(in);
+            model.palette[i].g = readF32(in);
+            model.palette[i].b = readF32(in);
+        }
+    } else if (version >= 3) {
+        // v3 had a fixed 16-entry palette.
+        model.palette.resize(16);
         for (int i = 0; i < 16; i++) {
             model.palette[i].r = readF32(in);
             model.palette[i].g = readF32(in);

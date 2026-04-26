@@ -22,16 +22,13 @@ struct BlockPlacement {
     int x, y, z;
     int typeId;
     int rx, ry, rz;
-    std::vector<int8_t> triColors; // palette index per triangle (-1 = unpainted)
+    std::vector<int16_t> triColors; // global palette index per triangle (pack*16+slot, -1 = unpainted)
 };
 
 struct ModelFile {
     std::vector<BlockTypeDef> blockTypes;
     std::vector<BlockPlacement> placements;
-    glm::vec3 palette[16] = {
-        {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f},
-        {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f},
-        {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f},
-        {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f}, {0.6f, 0.6f, 0.6f},
-    };
+    // Variable-size palette; size is always a multiple of 16 (one pack = 16 colors).
+    // Default: one pack of 16 grey entries.
+    std::vector<glm::vec3> palette = std::vector<glm::vec3>(16, glm::vec3(0.6f, 0.6f, 0.6f));
 };

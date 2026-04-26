@@ -21,24 +21,34 @@ static glm::vec3 rotatePoint(const glm::vec3& v, const glm::vec3& rotDeg) {
 
 static std::unordered_map<std::string, RegisteredMesh> gMeshes;
 static std::vector<DrawInstance> gDrawList;
-static glm::vec3 gPaintPalette[16] = {};
+// Variable-size paint palette. Size is always a multiple of 16 (one pack = 16
+// colors). Triangle paint indices are global: pack*16 + slotInPack.
+static std::vector<glm::vec3> gPaintPalette;
 static std::shared_ptr<Texture> gPaletteTexture;
 
-void setPaintPalette(const glm::vec3 palette[16]) {
-    for (int i = 0; i < 16; i++)
-        gPaintPalette[i] = palette[i];
+void setPaintPalette(const glm::vec3* palette, int count) {
+    if (count <= 0) {
+        gPaintPalette.clear();
+        gPaletteTexture.reset();
+        return;
+    }
+    gPaintPalette.assign(palette, palette + count);
 
-    unsigned char pixels[16 * 3];
-    for (int i = 0; i < 16; i++) {
+    std::vector<unsigned char> pixels((size_t)count * 3);
+    for (int i = 0; i < count; i++) {
         pixels[i * 3 + 0] = (unsigned char)(std::clamp(palette[i].r, 0.0f, 1.0f) * 255.0f);
         pixels[i * 3 + 1] = (unsigned char)(std::clamp(palette[i].g, 0.0f, 1.0f) * 255.0f);
         pixels[i * 3 + 2] = (unsigned char)(std::clamp(palette[i].b, 0.0f, 1.0f) * 255.0f);
     }
-    gPaletteTexture = std::make_shared<Texture>(pixels, 16, 1, 3);
+    gPaletteTexture = std::make_shared<Texture>(pixels.data(), count, 1, 3);
 }
 
 const glm::vec3* getPaintPalette() {
-    return gPaintPalette;
+    return gPaintPalette.empty() ? nullptr : gPaintPalette.data();
+}
+
+int getPaintPaletteCount() {
+    return (int)gPaintPalette.size();
 }
 
 void registerMesh(const char* name, const VE::MeshDef& def) {
@@ -314,7 +324,7 @@ std::vector<MergedMeshEntry> buildSingleMeshes() {
         std::vector<float> verts;
         std::vector<unsigned int> indices;
         struct PaintBucket { std::vector<float> verts; std::vector<unsigned int> indices; };
-        PaintBucket paintBuckets[16];
+        std::vector<PaintBucket> paintBuckets((size_t)gPaintPalette.size());
 
         for (int ii : instIndices) {
             const InstanceData& idata = instances[ii];
@@ -369,12 +379,12 @@ std::vector<MergedMeshEntry> buildSingleMeshes() {
                 // (one per cardinal face direction, matching the raycast face
                 // index the paint tool writes to). For non-rectangular meshes
                 // it has one entry per triangle.
-                int8_t colorIdx = -1;
+                int16_t colorIdx = -1;
                 int colorLookup = reg.rectangular ? fd : t;
                 if (col && colorLookup >= 0 && colorLookup < (int)col->triColors.size())
                     colorIdx = col->triColors[colorLookup];
 
-                if (colorIdx >= 0)
+                if (colorIdx >= 0 && colorIdx < (int)paintBuckets.size())
                     emitTri(paintBuckets[colorIdx].verts, paintBuckets[colorIdx].indices, i0, i1, i2);
                 else
                     emitTri(verts, indices, i0, i1, i2);
@@ -391,7 +401,7 @@ std::vector<MergedMeshEntry> buildSingleMeshes() {
             result.push_back({std::move(mesh), reg.texture});
         }
 
-        for (int c = 0; c < 16; c++) {
+        for (int c = 0; c < (int)paintBuckets.size(); c++) {
             auto& pb = paintBuckets[c];
             if (pb.verts.empty()) continue;
             std::unique_ptr<Mesh> mesh;

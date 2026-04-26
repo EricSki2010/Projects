@@ -20,7 +20,7 @@ struct BlockCollider {
     std::vector<Triangle> triangles;  // empty for rectangular meshes (uses AABB only)
     std::string meshName;
     bool isRectangular;               // true = AABB-only, false = triangle-level
-    std::vector<int8_t> triColors;    // palette index per triangle (-1 = unpainted)
+    std::vector<int16_t> triColors;   // global palette index per triangle (pack*16+slot, -1 = unpainted)
 };
 
 struct CollisionHit {
