@@ -355,6 +355,58 @@ static void uiCharCallback(GLFWwindow* /*win*/, unsigned int codepoint) {
         sCharBuffer.push_back((char)codepoint);
 }
 
+// Per-key timing for press-and-hold repeat. Indexed by GLFW key code.
+static double sKeyDownAt[GLFW_KEY_LAST + 1] = {};
+static double sKeyLastFire[GLFW_KEY_LAST + 1] = {};
+
+// Returns true on the press edge, then again after a 400ms initial delay
+// and every ~33ms while held — same cadence as the OS text-edit repeat.
+static bool shouldFireKeyRepeat(int key) {
+    bool down = glfwGetKey(ctx.window, key) == GLFW_PRESS;
+    bool wasDown = sKeyStates[key];
+    sKeyStates[key] = down;
+    if (!down) return false;
+    double now = glfwGetTime();
+    if (!wasDown) {
+        sKeyDownAt[key] = now;
+        sKeyLastFire[key] = now;
+        return true;
+    }
+    const double initialDelay = 0.4;
+    const double repeatInterval = 0.033;
+    if (now - sKeyDownAt[key] < initialDelay) return false;
+    if (now - sKeyLastFire[key] >= repeatInterval) {
+        sKeyLastFire[key] = now;
+        return true;
+    }
+    return false;
+}
+
+// Press-edge only — for one-shot actions like Home/End/Ctrl+V.
+static bool pressedThisFrame(int key) {
+    bool down = glfwGetKey(ctx.window, key) == GLFW_PRESS;
+    bool wasDown = sKeyStates[key];
+    sKeyStates[key] = down;
+    return down && !wasDown;
+}
+
+static bool ctrlHeld() {
+    return glfwGetKey(ctx.window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+           glfwGetKey(ctx.window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+}
+
+// Insert a single char at the caret if it passes the input's filters.
+// Returns true if inserted. Used by typing and paste.
+static bool insertCharAtCaret(UIElement* input, char c) {
+    if ((int)input->inputText.size() >= input->maxLength) return false;
+    if (input->numericOnly) {
+        if (!((c >= '0' && c <= '9') || c == '.' || c == '-')) return false;
+    }
+    input->inputText.insert(input->inputText.begin() + input->caretPos, c);
+    input->caretPos++;
+    return true;
+}
+
 static void processTextInput() {
     if (!sCharCallbackInstalled && ctx.window) {
         glfwSetCharCallback(ctx.window, uiCharCallback);
@@ -373,40 +425,50 @@ static void processTextInput() {
     if (input->caretPos > (int)input->inputText.size())
         input->caretPos = (int)input->inputText.size();
 
-    for (char c : sCharBuffer) {
-        if ((int)input->inputText.size() >= input->maxLength) break;
-        if (input->numericOnly) {
-            if (!((c >= '0' && c <= '9') || c == '.' || c == '-')) continue;
+    bool ctrl = ctrlHeld();
+
+    // Ctrl+V — paste clipboard at caret. Filtered through the same per-char
+    // rules as typing. GLFW returns NUL-terminated UTF-8; non-printable and
+    // non-ASCII bytes are dropped (matches the char callback's filter).
+    if (ctrl && pressedThisFrame(GLFW_KEY_V)) {
+        const char* clip = glfwGetClipboardString(ctx.window);
+        if (clip) {
+            for (const char* p = clip; *p; p++) {
+                char c = *p;
+                if (c == '\r') continue; // normalize CRLF
+                if (c == '\n') continue; // single-line for now; multi-line paste TBD
+                if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) continue;
+                if (!insertCharAtCaret(input, c)) break;
+            }
         }
-        input->inputText.insert(input->inputText.begin() + input->caretPos, c);
-        input->caretPos++;
+    }
+
+    // Drain typed characters. Skip while Ctrl is held so Ctrl+letter combos
+    // don't double-fire (GLFW does suppress most on Windows but be defensive).
+    if (!ctrl) {
+        for (char c : sCharBuffer) {
+            if (!insertCharAtCaret(input, c)) break;
+        }
     }
     sCharBuffer.clear();
 
-    // Backspace stays on key-poll: GLFW's char callback only emits printables.
-    {
-        bool down = glfwGetKey(ctx.window, GLFW_KEY_BACKSPACE) == GLFW_PRESS;
-        if (down && !sKeyStates[GLFW_KEY_BACKSPACE] && input->caretPos > 0) {
-            input->inputText.erase(input->inputText.begin() + (input->caretPos - 1));
-            input->caretPos--;
-        }
-        sKeyStates[GLFW_KEY_BACKSPACE] = down;
+    // Backspace, Left, Right — repeat while held.
+    if (shouldFireKeyRepeat(GLFW_KEY_BACKSPACE) && input->caretPos > 0) {
+        input->inputText.erase(input->inputText.begin() + (input->caretPos - 1));
+        input->caretPos--;
+    }
+    if (shouldFireKeyRepeat(GLFW_KEY_LEFT) && input->caretPos > 0) {
+        input->caretPos--;
+    }
+    if (shouldFireKeyRepeat(GLFW_KEY_RIGHT) &&
+        input->caretPos < (int)input->inputText.size()) {
+        input->caretPos++;
     }
 
-    // Left/Right move caret within the input.
-    {
-        bool down = glfwGetKey(ctx.window, GLFW_KEY_LEFT) == GLFW_PRESS;
-        if (down && !sKeyStates[GLFW_KEY_LEFT] && input->caretPos > 0)
-            input->caretPos--;
-        sKeyStates[GLFW_KEY_LEFT] = down;
-    }
-    {
-        bool down = glfwGetKey(ctx.window, GLFW_KEY_RIGHT) == GLFW_PRESS;
-        if (down && !sKeyStates[GLFW_KEY_RIGHT] &&
-            input->caretPos < (int)input->inputText.size())
-            input->caretPos++;
-        sKeyStates[GLFW_KEY_RIGHT] = down;
-    }
+    // Home / End — jump to start/end of field.
+    if (pressedThisFrame(GLFW_KEY_HOME)) input->caretPos = 0;
+    if (pressedThisFrame(GLFW_KEY_END))
+        input->caretPos = (int)input->inputText.size();
 }
 
 void processUIInput() {
