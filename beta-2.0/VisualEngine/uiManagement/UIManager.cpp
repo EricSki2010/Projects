@@ -389,7 +389,10 @@ void renderUI() {
                             float xHi = pixX + padding + measureText(
                                 line.substr(0, hi - lineStart), drawCopy.labelScale);
                             float y = topInPixels + (float)i * lineStep;
-                            drawSelectionRect(xLo, xHi, y, y + textH);
+                            // Shift down 2px so the highlight aligns with the
+                            // visible glyph row in multi-line. Single-line
+                            // doesn't need this; keep that alone per user QA.
+                            drawSelectionRect(xLo, xHi, y + 2.0f, y + textH + 2.0f);
                         }
                     }
 
