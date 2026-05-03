@@ -433,8 +433,10 @@ rz -> 3
 ## UI SYSTEM
 **Header:** `VisualEngine/uiManagement/UIElement.h`
 
-`UIElement { id, position, size, color, textureId, label, labelScale, labelColor, onClick, visible, hoverable, isTextInput, focused, inputText, placeholder, maxLength, onUnfocus, requireConfirm, confirmId }`
+`UIElement { id, position, size, color, textureId, label, labelScale, labelColor, onClick, visible, hoverable, isTextInput, focused, inputText, placeholder, maxLength, onUnfocus, multiline, numericOnly, caretPos, selAnchor, requireConfirm, confirmId }`
   UI element struct. Supports buttons, panels, images, and text inputs. Optional confirmation system via requireConfirm/confirmId. `hoverable` (default false) opts into the grow/lighten hover effect — when true, the element inflates by 5% and lightens by 0.1 RGB on hover, and click bounds match the inflated rect.
+
+  **Text input fields:** `caretPos` (0..inputText.size()) is the insertion point. `selAnchor` is the other end of an active selection or `-1` if none — the selected range is `[min(selAnchor, caretPos), max(selAnchor, caretPos)]`. `multiline` enables word-wrapped rendering. `numericOnly` restricts input to digits, `.`, and `-`. `maxLength` caps inputText length.
 
 **Header:** `VisualEngine/uiManagement/UIRenderer.h`
 **Implementation:** `VisualEngine/uiManagement/UIRenderer.cpp`
@@ -479,13 +481,24 @@ rz -> 3
   Removes all groups and elements.
 
 `renderUI()`
-  Draws all visible groups/elements. Renders labels centered on buttons. Renders text input content with blinking cursor. Highlights focused inputs and pending confirm buttons (+0.15 RGB). Hoverable elements under the cursor are drawn inflated by 5% with +0.1 RGB and 1.05× label scale; this stacks with the focus/pending tint if both apply.
+  Draws all visible groups/elements. Renders labels centered on buttons. Renders text input content with a solid-white blinking caret drawn as an overlay glyph (does not displace surrounding characters between blink phases). Active selections render as a soft-blue translucent rect behind the selected text; multi-line selections split per wrapped line. Highlights focused inputs and pending confirm buttons (+0.15 RGB). Hoverable elements under the cursor are drawn inflated by 5% with +0.1 RGB and 1.05× label scale; this stacks with the focus/pending tint if both apply.
 
 `processUIInput()`
-  Updates hover state, handles left-click detection, and processes keyboard input for focused text fields. Supports letters, numbers, space, dash, underscore, backspace.
+  Updates hover state, handles left-click detection (with click-position caret hit-testing on text inputs), tracks left-button drags inside focused inputs to extend selection, and processes keyboard input for focused text fields.
+
+  **Text input keys:**
+  - **Printable ASCII** (typed via GLFW char callback): inserts at caret. Replaces any active selection.
+  - **Backspace**: deletes the active selection if any, else deletes the char left of caret. Held: 400ms initial delay then ~30Hz repeat.
+  - **Left / Right**: moves the caret. With selection and no shift, collapses to the corresponding end. Held: same key-repeat cadence as Backspace.
+  - **Shift + Left / Right / Home / End**: extends selection (anchors at current caret if no selection yet).
+  - **Home / End**: jumps caret to start / end.
+  - **Ctrl + A**: selects all.
+  - **Ctrl + C**: copies the selected text via `glfwSetClipboardString` (no-op if nothing selected).
+  - **Ctrl + X**: copies selection then deletes it.
+  - **Ctrl + V**: deletes any selection, then pastes `glfwGetClipboardString` filtered through the same per-char rules as typing (printable ASCII, `numericOnly`, `maxLength`). CR/LF are stripped. The just-pasted span is left selected so the user can immediately retype to replace or arrow-away to deselect.
 
 `handleUIClick(mouseX, mouseY, screenWidth, screenHeight) -> bool`
-  Hit tests all visible elements back-to-front. Hoverable elements use the inflated (5%) bounds so clicks match the hover visual; non-hoverable elements use their raw bounds. Handles focus, confirmation system, and onClick. Returns true if something was hit.
+  Hit tests all visible elements back-to-front. Hoverable elements use the inflated (5%) bounds so clicks match the hover visual; non-hoverable elements use their raw bounds. Handles focus, confirmation system, and onClick. Clicking a text input also hit-tests the click x (and y for multi-line) to position the caret at the clicked column, leaves `selAnchor = -1`, and arms the drag tracker so subsequent mouse motion extends a selection. Returns true if something was hit.
 
 `isPointOverUI(mouseX, mouseY, screenWidth, screenHeight) -> bool`
   Returns true if the screen point is over any visible interactive element. Decorative elements (no onClick, not a text input, no confirmId/requireConfirm) are skipped — so full-panel backgrounds don't block clicks on raw-GL UI like the color wheel.
@@ -521,7 +534,7 @@ rz -> 3
   Creates a textured rectangle. Not hoverable by default; set `hoverable = true` on the returned element to opt in. Assigning an `onClick` promotes it to interactive for `isPointOverUI` purposes.
 
 `createTextInput(id, x, y, w, h, color, placeholder, maxLength) -> UIElement`
-  Creates a clickable text input field with placeholder text. Text inputs are always excluded from hover (they keep their own focused-lighter state). Set `element.multiline = true` after creation to enable word-wrapped rendering: text wraps by pixel width, lines stack top-down within the element, cursor appears at the end of the last line. Scenes that want the box to grow with content poll `inputWrappedLineCount(element)` each frame and set `size.y` accordingly.
+  Creates a clickable text input field with placeholder text. Text inputs are always excluded from hover (they keep their own focused-lighter state). Supports caret positioning by click, click-and-drag selection, shift+arrow selection extension, Ctrl+A/C/X/V, Home/End, and arrow/backspace key repeat — see `processUIInput()` for the full key list. Set `element.multiline = true` after creation to enable word-wrapped rendering: text wraps by pixel width, lines stack top-down within the element. Set `element.numericOnly = true` to restrict input to digits, `.`, and `-`. Scenes that want the box to grow with content poll `inputWrappedLineCount(element)` each frame and set `size.y` accordingly.
 
 `createSubButton(id, parentX, parentY, parentW, parentH, anchorX, anchorY, widthRatio, heightRatio, padding, color, label, onClick) -> UIElement`
   Creates a button positioned relative to a parent element. anchorX/anchorY (0-1) control alignment. widthRatio/heightRatio are fractions of parent size. padding is fraction of parent height. `hoverable = true`.
