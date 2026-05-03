@@ -240,35 +240,34 @@ void renderUI() {
                         pixY - pixH / 2.0f - textH / 2.0f,
                         drawCopy.labelScale, {0.5f, 0.5f, 0.5f, 0.7f});
                 } else if (!drawCopy.multiline) {
-                    std::string display = drawCopy.inputText;
+                    float textY = pixY - pixH / 2.0f - textH / 2.0f;
+                    drawText(drawCopy.inputText, pixX + padding, textY,
+                        drawCopy.labelScale, drawCopy.labelColor);
+
                     if (drawCopy.focused) {
                         int cp = drawCopy.caretPos;
                         if (cp < 0) cp = 0;
-                        if (cp > (int)display.size()) cp = (int)display.size();
+                        if (cp > (int)drawCopy.inputText.size())
+                            cp = (int)drawCopy.inputText.size();
                         double time = glfwGetTime();
                         bool on = ((int)(time * 2.0)) % 2 == 0;
-                        // Always reserve the caret slot so chars to the right
-                        // don't shift between blink phases.
-                        display.insert(display.begin() + cp, on ? '|' : ' ');
+                        if (on) {
+                            float caretOffset = measureText(
+                                drawCopy.inputText.substr(0, cp),
+                                drawCopy.labelScale);
+                            // Nudge the caret slightly left so it sits between
+                            // glyphs instead of overlapping the next one.
+                            drawText("|", pixX + padding + caretOffset - 2.0f, textY,
+                                drawCopy.labelScale, glm::vec4(1.0f));
+                        }
                     }
-                    drawText(display, pixX + padding,
-                        pixY - pixH / 2.0f - textH / 2.0f,
-                        drawCopy.labelScale, drawCopy.labelColor);
                 } else {
                     // Multi-line: use shared wrapTextToWidth so the line
                     // count matches what inputWrappedLineCount reports to
                     // the scene (which sizes the element accordingly).
-                    std::string display = drawCopy.inputText;
-                    if (drawCopy.focused) {
-                        int cp = drawCopy.caretPos;
-                        if (cp < 0) cp = 0;
-                        if (cp > (int)display.size()) cp = (int)display.size();
-                        double time = glfwGetTime();
-                        bool on = ((int)(time * 2.0)) % 2 == 0;
-                        display.insert(display.begin() + cp, on ? '|' : ' ');
-                    }
                     const float usableW = pixW - 2.0f * padding;
-                    auto lines = wrapTextToWidth(display, usableW, drawCopy.labelScale);
+                    auto lines = wrapTextToWidth(drawCopy.inputText, usableW,
+                        drawCopy.labelScale);
                     const float lineStep = textH + 4.0f;
                     // Stack lines top-down. pixY is the element's bottom edge
                     // in pixel space (y grows downward); the top edge is at
@@ -278,6 +277,37 @@ void renderUI() {
                         float y = topInPixels + (float)i * lineStep;
                         drawText(lines[i], pixX + padding, y,
                             drawCopy.labelScale, drawCopy.labelColor);
+                    }
+
+                    if (drawCopy.focused) {
+                        double time = glfwGetTime();
+                        bool on = ((int)(time * 2.0)) % 2 == 0;
+                        if (on) {
+                            // Walk the wrapped lines to find which one the
+                            // caret falls on and the column within it.
+                            int cp = drawCopy.caretPos;
+                            if (cp < 0) cp = 0;
+                            if (cp > (int)drawCopy.inputText.size())
+                                cp = (int)drawCopy.inputText.size();
+                            int consumed = 0;
+                            int caretLine = (int)lines.size() - 1;
+                            int caretCol = 0;
+                            for (size_t i = 0; i < lines.size(); i++) {
+                                int len = (int)lines[i].size();
+                                if (cp <= consumed + len) {
+                                    caretLine = (int)i;
+                                    caretCol = cp - consumed;
+                                    break;
+                                }
+                                consumed += len;
+                            }
+                            float caretOffset = measureText(
+                                lines[caretLine].substr(0, caretCol),
+                                drawCopy.labelScale);
+                            float y = topInPixels + (float)caretLine * lineStep;
+                            drawText("|", pixX + padding + caretOffset - 2.0f, y,
+                                drawCopy.labelScale, glm::vec4(1.0f));
+                        }
                     }
                 }
             }
