@@ -19,6 +19,11 @@ static std::string sPendingElementId;
 static int sHoveredGroupIdx = -1;
 static int sHoveredElementIdx = -1;
 
+// Active drag in a text input. Set on mouse-down inside an input; cleared on
+// mouse-up. While set, mouse motion extends the selection by re-hit-testing.
+static int sDragGroupIdx = -1;
+static int sDragElementIdx = -1;
+
 static bool isHoverable(const UIElement& e) {
     return e.hoverable && e.visible && !e.isTextInput;
 }
@@ -55,17 +60,36 @@ static float getCorrectedWidth(const UIElement& e);
 // Word-wrap `text` so each line fits within `usableW` pixels at the given
 // labelScale. Falls back to a hard-character break for words longer than
 // usableW. Always returns at least one line (possibly empty).
-static std::vector<std::string> wrapTextToWidth(const std::string& text, float usableW, float scale) {
+// Wraps text to a pixel width and also reports the source-text index where
+// each output line begins. Spaces and \n consumed by the wrap don't appear in
+// any line, so naively summing lines[i].size() misaligns caret/selection math
+// at every soft-wrap. srcStarts gives the authoritative source-coord mapping.
+struct WrappedLayout {
     std::vector<std::string> lines;
-    std::string cur, word;
+    std::vector<int> srcStarts;
+};
+
+static WrappedLayout wrapTextLayout(const std::string& text, float usableW, float scale) {
+    WrappedLayout out;
     auto widthOf = [&](const std::string& s) { return measureText(s, scale); };
+
+    std::string cur, word;
+    int curStart = 0;
+    int wordStart = 0;
+
+    auto pushLine = [&](const std::string& s, int start) {
+        out.lines.push_back(s);
+        out.srcStarts.push_back(start);
+    };
+
     auto flushWord = [&]() {
         if (word.empty()) return;
         std::string candidate = cur.empty() ? word : (cur + " " + word);
         if (widthOf(candidate) <= usableW) {
+            if (cur.empty()) curStart = wordStart;
             cur = candidate;
         } else {
-            if (!cur.empty()) lines.push_back(cur);
+            if (!cur.empty()) pushLine(cur, curStart);
             while (widthOf(word) > usableW && word.size() > 1) {
                 size_t lo = 1, hi = word.size();
                 while (lo < hi) {
@@ -73,22 +97,50 @@ static std::vector<std::string> wrapTextToWidth(const std::string& text, float u
                     if (widthOf(word.substr(0, mid)) <= usableW) lo = mid;
                     else hi = mid - 1;
                 }
-                lines.push_back(word.substr(0, lo));
+                pushLine(word.substr(0, lo), wordStart);
                 word = word.substr(lo);
+                wordStart += (int)lo;
             }
             cur = word;
+            curStart = wordStart;
         }
         word.clear();
     };
+
+    int srcIdx = 0;
     for (char c : text) {
-        if (c == '\n') { flushWord(); if (!cur.empty()) { lines.push_back(cur); cur.clear(); } }
-        else if (c == ' ' || c == '\t') { flushWord(); }
-        else word += c;
+        if (c == '\n') {
+            flushWord();
+            if (!cur.empty()) { pushLine(cur, curStart); cur.clear(); }
+        } else if (c == ' ' || c == '\t') {
+            flushWord();
+        } else {
+            if (word.empty()) wordStart = srcIdx;
+            word += c;
+        }
+        srcIdx++;
     }
     flushWord();
-    if (!cur.empty()) lines.push_back(cur);
-    if (lines.empty()) lines.push_back("");
-    return lines;
+    if (!cur.empty()) pushLine(cur, curStart);
+    if (out.lines.empty()) { out.lines.push_back(""); out.srcStarts.push_back(0); }
+    return out;
+}
+
+static std::vector<std::string> wrapTextToWidth(const std::string& text, float usableW, float scale) {
+    return wrapTextLayout(text, usableW, scale).lines;
+}
+
+// Convert a source-text caret index to (lineIdx, colInLine) inside a layout.
+// Caret on a consumed space (between two wrapped lines) pins to the end of
+// the previous line.
+static void layoutCaretLineCol(const WrappedLayout& L, int cp, int& outLine, int& outCol) {
+    outLine = 0;
+    for (int i = (int)L.lines.size() - 1; i >= 0; i--) {
+        if (L.srcStarts[i] <= cp) { outLine = i; break; }
+    }
+    outCol = cp - L.srcStarts[outLine];
+    int maxCol = (int)L.lines[outLine].size();
+    if (outCol > maxCol) outCol = maxCol;
 }
 
 int inputWrappedLineCount(const UIElement& e) {
@@ -106,8 +158,32 @@ static void unfocusAll() {
         for (auto& e : g.elements)
             if (e.isTextInput && e.focused) {
                 e.focused = false;
+                e.selAnchor = -1;
                 if (e.onUnfocus) e.onUnfocus(e.inputText);
             }
+}
+
+static bool hasSelection(const UIElement& e) {
+    return e.selAnchor >= 0 && e.selAnchor != e.caretPos;
+}
+
+static void getSelRange(const UIElement& e, int& outMin, int& outMax) {
+    if (!hasSelection(e)) { outMin = outMax = e.caretPos; return; }
+    outMin = std::min(e.selAnchor, e.caretPos);
+    outMax = std::max(e.selAnchor, e.caretPos);
+}
+
+static void clearSelection(UIElement& e) { e.selAnchor = -1; }
+
+// Erase the selected range (if any). Caret lands at the start of the
+// removed span. Returns true if anything was deleted.
+static bool deleteSelection(UIElement& e) {
+    if (!hasSelection(e)) return false;
+    int lo, hi; getSelRange(e, lo, hi);
+    e.inputText.erase(e.inputText.begin() + lo, e.inputText.begin() + hi);
+    e.caretPos = lo;
+    e.selAnchor = -1;
+    return true;
 }
 
 void addUIGroup(const std::string& groupId, bool visible) {
@@ -195,6 +271,23 @@ static bool hoverContainsPoint(const UIElement& e, glm::vec2 norm) {
            norm.y >= e.position.y - dy && norm.y <= e.position.y + e.size.y + dy;
 }
 
+// Draw a selection highlight rectangle in pixel coords. Converts to NDC
+// and emits a UIElement quad through the existing UI shader so blending and
+// rounded-corner state stay consistent.
+static void drawSelectionRect(float pixLeft, float pixRight,
+                              float pixTop, float pixBottom) {
+    if (pixRight <= pixLeft || pixBottom <= pixTop) return;
+    float nLeft   = pixLeft   / (float)ctx.width  * 2.0f - 1.0f;
+    float nRight  = pixRight  / (float)ctx.width  * 2.0f - 1.0f;
+    float nTop    = 1.0f - pixTop    / (float)ctx.height * 2.0f;
+    float nBottom = 1.0f - pixBottom / (float)ctx.height * 2.0f;
+    UIElement r;
+    r.position = glm::vec2(nLeft, nBottom);
+    r.size = glm::vec2(nRight - nLeft, nTop - nBottom);
+    r.color = glm::vec4(0.3f, 0.5f, 1.0f, 0.4f); // soft blue, semi-transparent
+    drawUIElement(r);
+}
+
 void renderUI() {
     for (int gi = 0; gi < (int)sGroups.size(); gi++) {
         const auto& g = sGroups[gi];
@@ -241,6 +334,17 @@ void renderUI() {
                         drawCopy.labelScale, {0.5f, 0.5f, 0.5f, 0.7f});
                 } else if (!drawCopy.multiline) {
                     float textY = pixY - pixH / 2.0f - textH / 2.0f;
+
+                    // Selection highlight (drawn before text so glyphs sit on top).
+                    if (drawCopy.focused && hasSelection(drawCopy)) {
+                        int lo, hi; getSelRange(drawCopy, lo, hi);
+                        float xLo = pixX + padding + measureText(
+                            drawCopy.inputText.substr(0, lo), drawCopy.labelScale);
+                        float xHi = pixX + padding + measureText(
+                            drawCopy.inputText.substr(0, hi), drawCopy.labelScale);
+                        drawSelectionRect(xLo, xHi, textY, textY + textH);
+                    }
+
                     drawText(drawCopy.inputText, pixX + padding, textY,
                         drawCopy.labelScale, drawCopy.labelColor);
 
@@ -262,20 +366,36 @@ void renderUI() {
                         }
                     }
                 } else {
-                    // Multi-line: use shared wrapTextToWidth so the line
-                    // count matches what inputWrappedLineCount reports to
-                    // the scene (which sizes the element accordingly).
+                    // Multi-line: layout gives lines + per-line source starts so
+                    // caret/selection math stays correct across consumed spaces.
                     const float usableW = pixW - 2.0f * padding;
-                    auto lines = wrapTextToWidth(drawCopy.inputText, usableW,
+                    auto layout = wrapTextLayout(drawCopy.inputText, usableW,
                         drawCopy.labelScale);
                     const float lineStep = textH + 4.0f;
-                    // Stack lines top-down. pixY is the element's bottom edge
-                    // in pixel space (y grows downward); the top edge is at
-                    // pixY - pixH. drawText takes y as the line's top.
                     float topInPixels = pixY - pixH + padding;
-                    for (size_t i = 0; i < lines.size(); i++) {
+
+                    // Selection highlight (per line) — drawn before text.
+                    if (drawCopy.focused && hasSelection(drawCopy)) {
+                        int selLo, selHi; getSelRange(drawCopy, selLo, selHi);
+                        for (size_t i = 0; i < layout.lines.size(); i++) {
+                            int lineStart = layout.srcStarts[i];
+                            int lineEnd = lineStart + (int)layout.lines[i].size();
+                            int lo = std::max(selLo, lineStart);
+                            int hi = std::min(selHi, lineEnd);
+                            if (lo >= hi) continue;
+                            const std::string& line = layout.lines[i];
+                            float xLo = pixX + padding + measureText(
+                                line.substr(0, lo - lineStart), drawCopy.labelScale);
+                            float xHi = pixX + padding + measureText(
+                                line.substr(0, hi - lineStart), drawCopy.labelScale);
+                            float y = topInPixels + (float)i * lineStep;
+                            drawSelectionRect(xLo, xHi, y, y + textH);
+                        }
+                    }
+
+                    for (size_t i = 0; i < layout.lines.size(); i++) {
                         float y = topInPixels + (float)i * lineStep;
-                        drawText(lines[i], pixX + padding, y,
+                        drawText(layout.lines[i], pixX + padding, y,
                             drawCopy.labelScale, drawCopy.labelColor);
                     }
 
@@ -283,26 +403,14 @@ void renderUI() {
                         double time = glfwGetTime();
                         bool on = ((int)(time * 2.0)) % 2 == 0;
                         if (on) {
-                            // Walk the wrapped lines to find which one the
-                            // caret falls on and the column within it.
                             int cp = drawCopy.caretPos;
                             if (cp < 0) cp = 0;
                             if (cp > (int)drawCopy.inputText.size())
                                 cp = (int)drawCopy.inputText.size();
-                            int consumed = 0;
-                            int caretLine = (int)lines.size() - 1;
-                            int caretCol = 0;
-                            for (size_t i = 0; i < lines.size(); i++) {
-                                int len = (int)lines[i].size();
-                                if (cp <= consumed + len) {
-                                    caretLine = (int)i;
-                                    caretCol = cp - consumed;
-                                    break;
-                                }
-                                consumed += len;
-                            }
+                            int caretLine, caretCol;
+                            layoutCaretLineCol(layout, cp, caretLine, caretCol);
                             float caretOffset = measureText(
-                                lines[caretLine].substr(0, caretCol),
+                                layout.lines[caretLine].substr(0, caretCol),
                                 drawCopy.labelScale);
                             float y = topInPixels + (float)caretLine * lineStep;
                             drawText("|", pixX + padding + caretOffset - 2.0f, y,
@@ -341,6 +449,54 @@ static void updateHover() {
             }
         }
     }
+}
+
+// Caret hit-test: given a click x in pixel coords and the element rect, find
+// the caret index inside e.inputText. Walks chars and splits at glyph midpoints
+// so clicking the left half of a char puts the caret before it, right half
+// puts it after. Single-line variant.
+static int hitTestCaretSingleLine(const UIElement& e, float clickPixX,
+                                  float pixX, float padding) {
+    const float scale = e.labelScale;
+    float originX = pixX + padding;
+    if (clickPixX <= originX) return 0;
+    float cumulative = 0.0f;
+    for (size_t i = 0; i < e.inputText.size(); i++) {
+        float charW = measureText(e.inputText.substr(i, 1), scale);
+        float midpoint = originX + cumulative + charW * 0.5f;
+        if (clickPixX < midpoint) return (int)i;
+        cumulative += charW;
+    }
+    return (int)e.inputText.size();
+}
+
+// Multi-line variant — picks the line based on click y, then a column within.
+static int hitTestCaretMultiLine(const UIElement& e, float clickPixX, float clickPixY,
+                                 float pixX, float pixY, float pixH,
+                                 float padding) {
+    const float scale = e.labelScale;
+    const float usableW = (getCorrectedWidth(e) / 2.0f * ctx.width) - 2.0f * padding;
+    auto layout = wrapTextLayout(e.inputText, usableW, scale);
+    if (layout.lines.empty()) return 0;
+    const float textH = measureTextHeight(scale);
+    const float lineStep = textH + 4.0f;
+    float topInPixels = pixY - pixH + padding;
+    int li = (int)((clickPixY - topInPixels) / lineStep);
+    if (li < 0) li = 0;
+    if (li >= (int)layout.lines.size()) li = (int)layout.lines.size() - 1;
+
+    int base = layout.srcStarts[li];
+    float originX = pixX + padding;
+    if (clickPixX <= originX) return base;
+    float cumulative = 0.0f;
+    const std::string& line = layout.lines[li];
+    for (size_t i = 0; i < line.size(); i++) {
+        float charW = measureText(line.substr(i, 1), scale);
+        float midpoint = originX + cumulative + charW * 0.5f;
+        if (clickPixX < midpoint) return base + (int)i;
+        cumulative += charW;
+    }
+    return base + (int)line.size();
 }
 
 // Buffer of printable characters typed since last drain. Filled by GLFW's
@@ -407,6 +563,22 @@ static bool insertCharAtCaret(UIElement* input, char c) {
     return true;
 }
 
+// Shift+arrow: ensure selAnchor is set (anchor at current caret if not), then
+// move caret. Plain arrow: if there's a selection, collapse to the appropriate
+// end and clear; otherwise normal caret move.
+static void moveCaretWithSelection(UIElement* input, int newCaret, bool shift) {
+    if (newCaret < 0) newCaret = 0;
+    if (newCaret > (int)input->inputText.size())
+        newCaret = (int)input->inputText.size();
+    if (shift) {
+        if (input->selAnchor < 0) input->selAnchor = input->caretPos;
+        input->caretPos = newCaret;
+    } else {
+        clearSelection(*input);
+        input->caretPos = newCaret;
+    }
+}
+
 static void processTextInput() {
     if (!sCharCallbackInstalled && ctx.window) {
         glfwSetCharCallback(ctx.window, uiCharCallback);
@@ -426,13 +598,43 @@ static void processTextInput() {
         input->caretPos = (int)input->inputText.size();
 
     bool ctrl = ctrlHeld();
+    bool shift = glfwGetKey(ctx.window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                 glfwGetKey(ctx.window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
 
-    // Ctrl+V — paste clipboard at caret. Filtered through the same per-char
-    // rules as typing. GLFW returns NUL-terminated UTF-8; non-printable and
-    // non-ASCII bytes are dropped (matches the char callback's filter).
+    // Ctrl+A — select all.
+    if (ctrl && pressedThisFrame(GLFW_KEY_A)) {
+        input->selAnchor = 0;
+        input->caretPos = (int)input->inputText.size();
+    }
+
+    // Ctrl+C — copy selection to clipboard. No-op when nothing is selected.
+    if (ctrl && pressedThisFrame(GLFW_KEY_C)) {
+        if (hasSelection(*input)) {
+            int lo, hi; getSelRange(*input, lo, hi);
+            std::string sel = input->inputText.substr(lo, hi - lo);
+            glfwSetClipboardString(ctx.window, sel.c_str());
+        }
+    }
+
+    // Ctrl+X — copy selection then delete it.
+    if (ctrl && pressedThisFrame(GLFW_KEY_X)) {
+        if (hasSelection(*input)) {
+            int lo, hi; getSelRange(*input, lo, hi);
+            std::string sel = input->inputText.substr(lo, hi - lo);
+            glfwSetClipboardString(ctx.window, sel.c_str());
+            deleteSelection(*input);
+        }
+    }
+
+    // Ctrl+V — paste clipboard at caret (replacing any selection). Filtered
+    // through the same per-char rules as typing. GLFW returns NUL-terminated
+    // UTF-8; non-printable and non-ASCII bytes are dropped (matches the char
+    // callback's filter).
     if (ctrl && pressedThisFrame(GLFW_KEY_V)) {
         const char* clip = glfwGetClipboardString(ctx.window);
         if (clip) {
+            deleteSelection(*input);
+            int pasteStart = input->caretPos;
             for (const char* p = clip; *p; p++) {
                 char c = *p;
                 if (c == '\r') continue; // normalize CRLF
@@ -440,35 +642,58 @@ static void processTextInput() {
                 if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) continue;
                 if (!insertCharAtCaret(input, c)) break;
             }
+            // Select the just-pasted span so the user can immediately retype
+            // or arrow-away to deselect.
+            if (input->caretPos > pasteStart)
+                input->selAnchor = pasteStart;
         }
     }
 
     // Drain typed characters. Skip while Ctrl is held so Ctrl+letter combos
     // don't double-fire (GLFW does suppress most on Windows but be defensive).
-    if (!ctrl) {
+    if (!ctrl && !sCharBuffer.empty()) {
+        deleteSelection(*input); // typing replaces a selection
         for (char c : sCharBuffer) {
             if (!insertCharAtCaret(input, c)) break;
         }
     }
     sCharBuffer.clear();
 
-    // Backspace, Left, Right — repeat while held.
-    if (shouldFireKeyRepeat(GLFW_KEY_BACKSPACE) && input->caretPos > 0) {
-        input->inputText.erase(input->inputText.begin() + (input->caretPos - 1));
-        input->caretPos--;
-    }
-    if (shouldFireKeyRepeat(GLFW_KEY_LEFT) && input->caretPos > 0) {
-        input->caretPos--;
-    }
-    if (shouldFireKeyRepeat(GLFW_KEY_RIGHT) &&
-        input->caretPos < (int)input->inputText.size()) {
-        input->caretPos++;
+    // Backspace — delete selection if any, else delete char left of caret.
+    if (shouldFireKeyRepeat(GLFW_KEY_BACKSPACE)) {
+        if (!deleteSelection(*input) && input->caretPos > 0) {
+            input->inputText.erase(input->inputText.begin() + (input->caretPos - 1));
+            input->caretPos--;
+        }
     }
 
-    // Home / End — jump to start/end of field.
-    if (pressedThisFrame(GLFW_KEY_HOME)) input->caretPos = 0;
+    // Left / Right — shift extends selection, plain collapses it.
+    if (shouldFireKeyRepeat(GLFW_KEY_LEFT)) {
+        int target;
+        if (!shift && hasSelection(*input)) {
+            int lo, hi; getSelRange(*input, lo, hi);
+            target = lo;
+        } else {
+            target = input->caretPos - 1;
+        }
+        moveCaretWithSelection(input, target, shift);
+    }
+    if (shouldFireKeyRepeat(GLFW_KEY_RIGHT)) {
+        int target;
+        if (!shift && hasSelection(*input)) {
+            int lo, hi; getSelRange(*input, lo, hi);
+            target = hi;
+        } else {
+            target = input->caretPos + 1;
+        }
+        moveCaretWithSelection(input, target, shift);
+    }
+
+    // Home / End — jump to start/end of field. Shift extends selection.
+    if (pressedThisFrame(GLFW_KEY_HOME))
+        moveCaretWithSelection(input, 0, shift);
     if (pressedThisFrame(GLFW_KEY_END))
-        input->caretPos = (int)input->inputText.size();
+        moveCaretWithSelection(input, (int)input->inputText.size(), shift);
 }
 
 void processUIInput() {
@@ -479,6 +704,37 @@ void processUIInput() {
         double mx, my;
         glfwGetCursorPos(ctx.window, &mx, &my);
         handleUIClick(mx, my, ctx.width, ctx.height);
+    } else if (leftDown && sDragGroupIdx >= 0 && sDragElementIdx >= 0) {
+        // Mouse drag inside a text input — extend selection by re-hit-testing.
+        if (sDragGroupIdx < (int)sGroups.size()) {
+            auto& grp = sGroups[sDragGroupIdx];
+            if (sDragElementIdx < (int)grp.elements.size()) {
+                UIElement& e = grp.elements[sDragElementIdx];
+                if (e.isTextInput && e.focused) {
+                    double mx, my;
+                    glfwGetCursorPos(ctx.window, &mx, &my);
+                    float pixX, pixY, pixW, pixH;
+                    normToPixel(e, pixX, pixY, pixW, pixH);
+                    const float padding = 8.0f;
+                    int caret;
+                    if (e.multiline) {
+                        caret = hitTestCaretMultiLine(e, (float)mx, (float)my,
+                            pixX, pixY, pixH, padding);
+                    } else {
+                        caret = hitTestCaretSingleLine(e, (float)mx, pixX, padding);
+                    }
+                    // First time the caret actually moves during drag, anchor
+                    // the selection at where the click started (current caret).
+                    if (caret != e.caretPos && e.selAnchor < 0)
+                        e.selAnchor = e.caretPos;
+                    e.caretPos = caret;
+                }
+            }
+        }
+    }
+    if (!leftDown) {
+        sDragGroupIdx = -1;
+        sDragElementIdx = -1;
     }
     sWasLeftDown = leftDown;
 
@@ -510,7 +766,20 @@ bool handleUIClick(double mouseX, double mouseY, int screenWidth, int screenHeig
 
                 if (e.isTextInput) {
                     e.focused = true;
-                    e.caretPos = (int)e.inputText.size();
+                    float pixX, pixY, pixW, pixH;
+                    normToPixel(e, pixX, pixY, pixW, pixH);
+                    const float padding = 8.0f;
+                    int caret;
+                    if (e.multiline) {
+                        caret = hitTestCaretMultiLine(e, (float)mouseX, (float)mouseY,
+                            pixX, pixY, pixH, padding);
+                    } else {
+                        caret = hitTestCaretSingleLine(e, (float)mouseX, pixX, padding);
+                    }
+                    e.caretPos = caret;
+                    e.selAnchor = -1; // no selection; drag will create one
+                    sDragGroupIdx = gi;
+                    sDragElementIdx = ei;
                     cancelPendingConfirm();
                     return true;
                 }

@@ -33,6 +33,10 @@ struct UIElement {
     // Caret position within inputText (0..inputText.size()). Snapped to end
     // on focus; moved by Left/Right arrows; insertions/deletions happen here.
     int caretPos = 0;
+    // Selection anchor. -1 means "no selection". When set, the selected range
+    // is [min(selAnchor, caretPos), max(selAnchor, caretPos)]. The caret is
+    // always at one end of the selection.
+    int selAnchor = -1;
 
     // When true, width is adjusted by aspect ratio so equal w/h values render as a square
     bool aspectCorrected = false;
