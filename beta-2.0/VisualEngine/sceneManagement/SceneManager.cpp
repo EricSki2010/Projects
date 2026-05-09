@@ -8,7 +8,7 @@ void registerScene(const std::string& name, const SceneDef& scene) {
     sScenes[name] = scene;
 }
 
-void setActiveScene(const std::string& name, void* data) {
+void setActiveScene(const std::string& name, std::shared_ptr<void> data) {
     if (sActiveScene && sActiveScene->onExit)
         sActiveScene->onExit();
 
@@ -17,7 +17,7 @@ void setActiveScene(const std::string& name, void* data) {
         sActiveSceneName = name;
         sActiveScene = &it->second;
         if (sActiveScene->onEnter)
-            sActiveScene->onEnter(data);
+            sActiveScene->onEnter(std::move(data));
     }
 }
 

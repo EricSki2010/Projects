@@ -23,6 +23,7 @@
 #include <functional>
 #include <algorithm>
 #include <filesystem>
+#include <memory>
 #include <vector>
 #include <fstream>
 #include <iostream>
@@ -40,13 +41,13 @@ static bool sWasSpaceDown = false;
 static bool sWasCtrlZDown = false;
 static bool sWasF5Down = false;
 static bool sWasLeftDown = false;
-static Texture* sBlockSelectorPlus = nullptr;
-static Texture* sBlockSelectorMinus = nullptr;
-static Texture* sBlockSelectorTilde = nullptr;
+static std::unique_ptr<Texture> sBlockSelectorPlus;
+static std::unique_ptr<Texture> sBlockSelectorMinus;
+static std::unique_ptr<Texture> sBlockSelectorTilde;
 static const int SLOTS_PER_PAGE = 15;
 static std::vector<std::string> sSlotMesh;       // empty = unassigned; size = sPageCount*SLOTS_PER_PAGE
 static std::vector<RenderTarget> sSlotRT;
-static std::vector<Mesh*> sSlotPreviewMesh;
+static std::vector<std::unique_ptr<Mesh>> sSlotPreviewMesh;
 static int sSelectedSlot = -1;                   // global index
 static int sSlotPage = 0;                        // currently visible pack
 static int sPageCount = 1;                       // number of 15-slot packs
@@ -276,7 +277,7 @@ static void allocSlotResources(int newSize) {
     if (newSize <= oldSize) return;
     sSlotMesh.resize(newSize, "");
     sSlotRT.resize(newSize);
-    sSlotPreviewMesh.resize(newSize, nullptr);
+    sSlotPreviewMesh.resize(newSize);
     for (int i = oldSize; i < newSize; i++) {
         sSlotRT[i] = createRenderTarget(128, 128);
         clearSlotRT(i);
@@ -326,7 +327,7 @@ static void deletePack(int pageIdx) {
             std::filesystem::remove(path, ec);
         }
         sSlotMesh[i] = "";
-        if (sSlotPreviewMesh[i]) { delete sSlotPreviewMesh[i]; sSlotPreviewMesh[i] = nullptr; }
+        sSlotPreviewMesh[i].reset();
         clearSlotRT(i);
     }
 
@@ -340,7 +341,7 @@ static void deletePack(int pageIdx) {
         if (!allEmpty) break;
         for (int i = s; i < e && i < (int)sSlotMesh.size(); i++) {
             destroyRenderTarget(sSlotRT[i]);
-            if (sSlotPreviewMesh[i]) { delete sSlotPreviewMesh[i]; sSlotPreviewMesh[i] = nullptr; }
+            sSlotPreviewMesh[i].reset();
         }
         newPages--;
     }
@@ -706,7 +707,7 @@ static void openPauseMenu() {
 void register3dModelerScene() {
     VE::registerScene("3dModeler",
         // onEnter
-        [](void* data) {
+        [](std::shared_ptr<void> data) {
             sPaused = false;
             getGlobalCamera()->setMode(CAMERA_FPS);
             initHighlight();
@@ -845,9 +846,9 @@ void register3dModelerScene() {
             }
 
             // Load block selector textures
-            sBlockSelectorPlus = new Texture(EMBEDDED_SELECTOR_PLUS, EMBEDDED_SELECTOR_PLUS_SIZE);
-            sBlockSelectorMinus = new Texture(EMBEDDED_SELECTOR_MINUS, EMBEDDED_SELECTOR_MINUS_SIZE);
-            sBlockSelectorTilde = new Texture(EMBEDDED_SELECTOR_TILDE, EMBEDDED_SELECTOR_TILDE_SIZE);
+            sBlockSelectorPlus = std::make_unique<Texture>(EMBEDDED_SELECTOR_PLUS, EMBEDDED_SELECTOR_PLUS_SIZE);
+            sBlockSelectorMinus = std::make_unique<Texture>(EMBEDDED_SELECTOR_MINUS, EMBEDDED_SELECTOR_MINUS_SIZE);
+            sBlockSelectorTilde = std::make_unique<Texture>(EMBEDDED_SELECTOR_TILDE, EMBEDDED_SELECTOR_TILDE_SIZE);
             sPreviewAngle = 0.0f;
             sLastPreviewTime = glfwGetTime();
 
@@ -867,7 +868,8 @@ void register3dModelerScene() {
 
             // Create render targets and preview meshes for slots
             sSlotRT.assign(totalSlots, RenderTarget{});
-            sSlotPreviewMesh.assign(totalSlots, nullptr);
+            sSlotPreviewMesh.clear();
+            sSlotPreviewMesh.resize(totalSlots);
             for (int i = 0; i < totalSlots; i++) {
                 sSlotRT[i] = createRenderTarget(128, 128);
                 clearSlotRT(i);
@@ -875,11 +877,11 @@ void register3dModelerScene() {
                     const RegisteredMesh* reg = getRegisteredMesh(sSlotMesh[i].c_str());
                     if (reg) {
                         if (reg->floatsPerVertex == 8)
-                            sSlotPreviewMesh[i] = new Mesh(
+                            sSlotPreviewMesh[i] = std::make_unique<Mesh>(
                                 const_cast<float*>(reg->vertices.data()), reg->vertexCount,
                                 const_cast<unsigned int*>(reg->indices.data()), reg->indexCount, true);
                         else
-                            sSlotPreviewMesh[i] = new Mesh(
+                            sSlotPreviewMesh[i] = std::make_unique<Mesh>(
                                 const_cast<float*>(reg->vertices.data()), reg->vertexCount,
                                 const_cast<unsigned int*>(reg->indices.data()), reg->indexCount);
                     }
@@ -939,8 +941,7 @@ void register3dModelerScene() {
                                     : cur;
                                 sPendingSlotUpdate = sSelectedSlot;
                                 sPendingSlotMesh = meshName;
-                                auto* editData = new VectorMeshEditData{meshName, sSelectedSlot, sModelName};
-                                VE::setScene("vectorMesh", editData);
+                                VE::setScene("vectorMesh", std::make_shared<VectorMeshEditData>(VectorMeshEditData{meshName, sSelectedSlot, sModelName}));
                             }
                         ));
                     } else {
@@ -1188,7 +1189,7 @@ void register3dModelerScene() {
 
             // Load model if name was passed
             if (data) {
-                std::string* name = static_cast<std::string*>(data);
+                auto name = std::static_pointer_cast<std::string>(data);
                 sModelName = *name;
                 setMemoryPath("assets/saves/3dModels");
                 sUndoStack.clear();
@@ -1242,7 +1243,6 @@ void register3dModelerScene() {
                         }
                     }
                 }
-                delete name;
             }
 
             // Apply pending slot update from vector mesh editor
@@ -1259,13 +1259,12 @@ void register3dModelerScene() {
                     // Create preview mesh for the slot
                     const RegisteredMesh* reg = getRegisteredMesh(sPendingSlotMesh.c_str());
                     if (reg) {
-                        delete sSlotPreviewMesh[sPendingSlotUpdate];
                         if (reg->floatsPerVertex == 8)
-                            sSlotPreviewMesh[sPendingSlotUpdate] = new Mesh(
+                            sSlotPreviewMesh[sPendingSlotUpdate] = std::make_unique<Mesh>(
                                 const_cast<float*>(reg->vertices.data()), reg->vertexCount,
                                 const_cast<unsigned int*>(reg->indices.data()), reg->indexCount, true);
                         else
-                            sSlotPreviewMesh[sPendingSlotUpdate] = new Mesh(
+                            sSlotPreviewMesh[sPendingSlotUpdate] = std::make_unique<Mesh>(
                                 const_cast<float*>(reg->vertices.data()), reg->vertexCount,
                                 const_cast<unsigned int*>(reg->indices.data()), reg->indexCount);
                     }
@@ -1290,16 +1289,12 @@ void register3dModelerScene() {
                 saveCurrentModel();
             cleanupHighlight();
             cleanupOverlay();
-            delete sBlockSelectorPlus;
-            delete sBlockSelectorMinus;
-            delete sBlockSelectorTilde;
-            sBlockSelectorPlus = nullptr;
-            sBlockSelectorMinus = nullptr;
-            sBlockSelectorTilde = nullptr;
+            sBlockSelectorPlus.reset();
+            sBlockSelectorMinus.reset();
+            sBlockSelectorTilde.reset();
             for (int i = 0; i < (int)sSlotRT.size(); i++) {
                 destroyRenderTarget(sSlotRT[i]);
-                delete sSlotPreviewMesh[i];
-                sSlotPreviewMesh[i] = nullptr;
+                sSlotPreviewMesh[i].reset();
             }
             cleanupTextRenderer();
             cleanupUIRenderer();
@@ -1449,8 +1444,7 @@ void register3dModelerScene() {
                             : cur;
                         sPendingSlotUpdate = sSelectedSlot;
                         sPendingSlotMesh = meshName;
-                        auto* editData = new VectorMeshEditData{meshName, sSelectedSlot, sModelName};
-                        VE::setScene("vectorMesh", editData);
+                        VE::setScene("vectorMesh", std::make_shared<VectorMeshEditData>(VectorMeshEditData{meshName, sSelectedSlot, sModelName}));
                     }
                 } else {
                     UIElement* actionBtn = getUIElement("sidebar", "action_btn");
@@ -1817,8 +1811,7 @@ void register3dModelerScene() {
         std::string meshName = cur.empty() ? ("slot_" + std::to_string(slot)) : cur;
         sPendingSlotUpdate = slot;
         sPendingSlotMesh = meshName;
-        auto* editData = new VectorMeshEditData{meshName, slot, sModelName};
-        VE::setScene("vectorMesh", editData);
+        VE::setScene("vectorMesh", std::make_shared<VectorMeshEditData>(VectorMeshEditData{meshName, slot, sModelName}));
         return AI::Json{{"slot", slot}, {"mesh_name", meshName}};
     });
 }

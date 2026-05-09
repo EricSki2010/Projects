@@ -5,6 +5,7 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <memory>
 #include <unordered_map>
 #include <string>
 
@@ -71,12 +72,11 @@ public:
 
     // Vertex-colored mesh factory. Input is interleaved pos3 + normal3 + color3
     // (9 floats per vertex). Built mesh must be drawn with the engine's
-    // vertex-colored shader (ctx.vcShader). Returns a heap-allocated Mesh —
-    // caller owns it.
-    static Mesh* createVertexColored(const float* verticesPosNormalColor,
-                                     int vertexCount,
-                                     const unsigned int* indices,
-                                     int indexCount);
+    // vertex-colored shader (ctx.vcShader).
+    static std::unique_ptr<Mesh> createVertexColored(const float* verticesPosNormalColor,
+                                                     int vertexCount,
+                                                     const unsigned int* indices,
+                                                     int indexCount);
     Mesh(const Mesh&) = delete;
     Mesh& operator=(const Mesh&) = delete;
     void setTexture(Texture* tex);

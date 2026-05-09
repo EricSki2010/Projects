@@ -2,14 +2,15 @@
 #include "DotShaders.h"
 #include "../render.h"
 #include "../../EngineGlobals.h"
+#include <memory>
 
 static unsigned int sDotVAO = 0;
 static unsigned int sDotVBO = 0;
 static unsigned int sDotEBO = 0;
-static Shader* sDotShader = nullptr;
+static std::unique_ptr<Shader> sDotShader;
 
 void initDotRenderer() {
-    sDotShader = new Shader(dotVertSrc, dotFragSrc);
+    sDotShader = std::make_unique<Shader>(dotVertSrc, dotFragSrc);
 
     // Unit quad centered at origin
     float verts[] = {
@@ -42,8 +43,7 @@ void cleanupDotRenderer() {
     if (sDotVAO) { glDeleteVertexArrays(1, &sDotVAO); sDotVAO = 0; }
     if (sDotVBO) { glDeleteBuffers(1, &sDotVBO); sDotVBO = 0; }
     if (sDotEBO) { glDeleteBuffers(1, &sDotEBO); sDotEBO = 0; }
-    delete sDotShader;
-    sDotShader = nullptr;
+    sDotShader.reset();
 }
 
 void drawDot(const glm::vec3& position, float size, const glm::vec3& color, float alpha) {

@@ -6,6 +6,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
+#include <memory>
 #include <unordered_map>
 #include <iostream>
 
@@ -19,7 +20,7 @@ struct GlyphInfo {
 static std::unordered_map<char, GlyphInfo> sGlyphs;
 static unsigned int sTextVAO = 0;
 static unsigned int sTextVBO = 0;
-static Shader* sTextShader = nullptr;
+static std::unique_ptr<Shader> sTextShader;
 
 static bool loadGlyphs(FT_Face face, int fontSize) {
     FT_Set_Pixel_Sizes(face, 0, fontSize);
@@ -50,7 +51,7 @@ static bool loadGlyphs(FT_Face face, int fontSize) {
 }
 
 static void initTextGL() {
-    sTextShader = new Shader(textVertSrc, textFragSrc);
+    sTextShader = std::make_unique<Shader>(textVertSrc, textFragSrc);
 
     glGenVertexArrays(1, &sTextVAO);
     glGenBuffers(1, &sTextVBO);
@@ -111,8 +112,7 @@ void cleanupTextRenderer() {
 
     if (sTextVAO) { glDeleteVertexArrays(1, &sTextVAO); sTextVAO = 0; }
     if (sTextVBO) { glDeleteBuffers(1, &sTextVBO); sTextVBO = 0; }
-    delete sTextShader;
-    sTextShader = nullptr;
+    sTextShader.reset();
 }
 
 void drawText(const std::string& text, float x, float y, float scale, const glm::vec4& color) {

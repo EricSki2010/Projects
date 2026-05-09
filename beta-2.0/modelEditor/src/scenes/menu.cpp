@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 
 static bool sLoadView = false;
 
@@ -173,7 +174,7 @@ static void showFileList(const std::string& type) {
                     BTN_X, y, BTN_W, BTN_H, BTN_COLOR,
                     name,
                     [name]() {
-                        VE::setScene("3dModeler", new std::string(name));
+                        VE::setScene("3dModeler", std::make_shared<std::string>(name));
                     }
                 );
                 fileBtn.requireConfirm = true;
@@ -259,7 +260,7 @@ static void showFileList(const std::string& type) {
 void registerMenuScene() {
     VE::registerScene("menu",
         // onEnter
-        [](void* data) {
+        [](std::shared_ptr<void> data) {
             sLoadView = false;
             getGlobalCamera()->setMode(CAMERA_FLAT);
             initUIRenderer();

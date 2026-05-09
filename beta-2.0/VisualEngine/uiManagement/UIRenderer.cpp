@@ -2,14 +2,15 @@
 #include "UIShaders.h"
 #include "../renderingManagement/render.h"
 #include "../EngineGlobals.h"
+#include <memory>
 
 static unsigned int sUIVAO = 0;
 static unsigned int sUIVBO = 0;
 static unsigned int sUIEBO = 0;
-static Shader* sUIShader = nullptr;
+static std::unique_ptr<Shader> sUIShader;
 
 void initUIRenderer() {
-    sUIShader = new Shader(uiVertSrc, uiFragSrc);
+    sUIShader = std::make_unique<Shader>(uiVertSrc, uiFragSrc);
 
     // Unit quad: bottom-left at (0,0), top-right at (1,1)
     float vertices[] = {
@@ -47,8 +48,7 @@ void cleanupUIRenderer() {
     if (sUIVAO) { glDeleteVertexArrays(1, &sUIVAO); sUIVAO = 0; }
     if (sUIVBO) { glDeleteBuffers(1, &sUIVBO); sUIVBO = 0; }
     if (sUIEBO) { glDeleteBuffers(1, &sUIEBO); sUIEBO = 0; }
-    delete sUIShader;
-    sUIShader = nullptr;
+    sUIShader.reset();
 }
 
 void drawUIElement(const UIElement& element) {
@@ -91,5 +91,5 @@ void drawUIElement(const UIElement& element) {
 }
 
 Shader* getUIShader() {
-    return sUIShader;
+    return sUIShader.get();
 }

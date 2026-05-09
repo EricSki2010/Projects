@@ -23,6 +23,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <numeric>
@@ -359,7 +360,7 @@ static void openVMeshPauseMenu() {
             VE::setBrightness(1.0f);
             removeUIGroup("vmesh_pause");
             if (!sReturnModelName.empty())
-                VE::setScene("3dModeler", new std::string(sReturnModelName));
+                VE::setScene("3dModeler", std::make_shared<std::string>(sReturnModelName));
             else
                 VE::setScene("menu");
         }
@@ -724,7 +725,7 @@ static void aiFinishVMeshEdit() {
     VE::setBrightness(1.0f);
     removeUIGroup("vmesh_pause");
     if (!sReturnModelName.empty())
-        VE::setScene("3dModeler", new std::string(sReturnModelName));
+        VE::setScene("3dModeler", std::make_shared<std::string>(sReturnModelName));
     else
         VE::setScene("menu");
 }
@@ -739,7 +740,7 @@ static int getSnapCount() {
 void registerVectorMeshScene() {
     VE::registerScene("vectorMesh",
         // onEnter
-        [](void* data) {
+        [](std::shared_ptr<void> data) {
             getGlobalCamera()->setMode(CAMERA_FPS);
             initLineRenderer();
             initDotRenderer();
@@ -765,11 +766,10 @@ void registerVectorMeshScene() {
 
             // Load vector mesh if data was passed
             if (data) {
-                auto* editData = static_cast<VectorMeshEditData*>(data);
+                auto editData = std::static_pointer_cast<VectorMeshEditData>(data);
                 loadVectorMesh(editData->meshName);
                 sReturnSlot = editData->slotIndex;
                 sReturnModelName = editData->modelName;
-                delete editData;
             }
             sVMeshUndoStack.clear();
 
@@ -969,7 +969,7 @@ void registerVectorMeshScene() {
                 VE::setBrightness(1.0f);
                 removeUIGroup("vmesh_pause");
                 if (!sReturnModelName.empty())
-                    VE::setScene("3dModeler", new std::string(sReturnModelName));
+                    VE::setScene("3dModeler", std::make_shared<std::string>(sReturnModelName));
                 else
                     VE::setScene("menu");
                 return;

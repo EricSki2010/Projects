@@ -175,7 +175,7 @@ void setSpecularStrength(float strength) {
     glUniform1f(ctx.shader->loc("specularStrength"), strength);
 }
 
-void registerScene(const std::string& name, std::function<void(void*)> onEnter,
+void registerScene(const std::string& name, std::function<void(std::shared_ptr<void>)> onEnter,
                    std::function<void()> onExit,
                    std::function<void(float dt)> onInput,
                    std::function<void()> onUpdate,
@@ -189,8 +189,8 @@ void registerScene(const std::string& name, std::function<void(void*)> onEnter,
     ::registerScene(name, def);
 }
 
-void setScene(const std::string& name, void* data) {
-    setActiveScene(name, data);
+void setScene(const std::string& name, std::shared_ptr<void> data) {
+    setActiveScene(name, std::move(data));
 }
 
 void run() {

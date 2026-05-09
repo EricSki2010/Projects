@@ -2,6 +2,7 @@
 
 #include <string>
 #include <functional>
+#include <memory>
 #include <glm/glm.hpp>
 
 namespace VE {
@@ -35,12 +36,12 @@ void undraw(float x, float y, float z);
 void clearDraws();
 void rebuild();
 bool hasBlockAt(int x, int y, int z);
-void registerScene(const std::string& name, std::function<void(void*)> onEnter,
+void registerScene(const std::string& name, std::function<void(std::shared_ptr<void>)> onEnter,
                    std::function<void()> onExit,
                    std::function<void(float dt)> onInput,
                    std::function<void()> onUpdate,
                    std::function<void()> onRender);
-void setScene(const std::string& name, void* data = nullptr);
+void setScene(const std::string& name, std::shared_ptr<void> data = nullptr);
 void setBrightness(float brightness);
 void setSpecularStrength(float strength);
 void setGradientBackground(bool enable, glm::vec3 top = glm::vec3(0.0f), glm::vec3 bottom = glm::vec3(0.7f));

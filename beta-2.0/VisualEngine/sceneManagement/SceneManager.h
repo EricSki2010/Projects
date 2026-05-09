@@ -1,11 +1,12 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
 struct SceneDef {
-    std::function<void(void* data)> onEnter;
+    std::function<void(std::shared_ptr<void> data)> onEnter;
     std::function<void()> onExit;
     std::function<void(float dt)> onInput;
     std::function<void()> onUpdate;
@@ -13,6 +14,6 @@ struct SceneDef {
 };
 
 void registerScene(const std::string& name, const SceneDef& scene);
-void setActiveScene(const std::string& name, void* data = nullptr);
+void setActiveScene(const std::string& name, std::shared_ptr<void> data = nullptr);
 const std::string& getActiveSceneName();
 SceneDef* getActiveScene();

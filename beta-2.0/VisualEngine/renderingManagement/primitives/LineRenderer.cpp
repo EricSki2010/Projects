@@ -2,14 +2,15 @@
 #include "LineShaders.h"
 #include "../render.h"
 #include "../../EngineGlobals.h"
+#include <memory>
 
 static unsigned int sLineVAO = 0;
 static unsigned int sLineVBO = 0;
-static Shader* sLineShader = nullptr;
+static std::unique_ptr<Shader> sLineShader;
 static const int MAX_LINE_VERTS = 4096;
 
 void initLineRenderer() {
-    sLineShader = new Shader(lineVertSrc, lineFragSrc);
+    sLineShader = std::make_unique<Shader>(lineVertSrc, lineFragSrc);
 
     glGenVertexArrays(1, &sLineVAO);
     glGenBuffers(1, &sLineVBO);
@@ -27,8 +28,7 @@ void initLineRenderer() {
 void cleanupLineRenderer() {
     if (sLineVAO) { glDeleteVertexArrays(1, &sLineVAO); sLineVAO = 0; }
     if (sLineVBO) { glDeleteBuffers(1, &sLineVBO); sLineVBO = 0; }
-    delete sLineShader;
-    sLineShader = nullptr;
+    sLineShader.reset();
 }
 
 void drawLine(const glm::vec3& from, const glm::vec3& to, const glm::vec3& color, float width) {

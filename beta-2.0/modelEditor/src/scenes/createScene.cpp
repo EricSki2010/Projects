@@ -9,6 +9,7 @@
 #include "../../../VisualEngine/uiManagement/EmbeddedFont.h"
 #include "../../../VisualEngine/memoryManagement/memory.h"
 #include "../prefabs/templates.h"
+#include <memory>
 
 
 static std::string sSelectedType;
@@ -165,7 +166,7 @@ static void rebuildLayout() {
                     }
 
                     saveModel(name, model);
-                    VE::setScene("3dModeler", new std::string(name));
+                    VE::setScene("3dModeler", std::make_shared<std::string>(name));
                 }
             }
         ));
@@ -184,7 +185,7 @@ static void rebuildLayout() {
 void registerCreateScene() {
     VE::registerScene("createScene",
         // onEnter
-        [](void* data) {
+        [](std::shared_ptr<void> data) {
             sSelectedType = "";
             sSelectedTemplate = "";
             sSavedName = "";

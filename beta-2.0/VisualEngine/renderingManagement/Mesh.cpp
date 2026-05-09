@@ -1,6 +1,8 @@
 #include "render.h"
 #include <iostream>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 void Mesh::computeNormals(float* vertices, int vertCount, unsigned int* indices, int idxCount,
                           float* outBuffer) {
@@ -55,8 +57,8 @@ Mesh::Mesh(float* vertices, int vertCount, unsigned int* indices, int idxCount) 
     color = glm::vec3(0.8f);
 
     // build interleaved buffer: pos(3) uv(2) normal(3)
-    float* buffer = new float[vertCount * 8];
-    computeNormals(vertices, vertCount, indices, idxCount, buffer);
+    std::vector<float> buffer(vertCount * 8);
+    computeNormals(vertices, vertCount, indices, idxCount, buffer.data());
 
     glGenVertexArrays(1, &VAO);
     glGenBuffers(1, &VBO);
@@ -65,7 +67,7 @@ Mesh::Mesh(float* vertices, int vertCount, unsigned int* indices, int idxCount) 
     glBindVertexArray(VAO);
 
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, vertCount * 8 * sizeof(float), buffer, GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, vertCount * 8 * sizeof(float), buffer.data(), GL_STATIC_DRAW);
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, idxCount * sizeof(unsigned int), indices, GL_STATIC_DRAW);
@@ -81,8 +83,6 @@ Mesh::Mesh(float* vertices, int vertCount, unsigned int* indices, int idxCount) 
     glEnableVertexAttribArray(2);
 
     glBindVertexArray(0);
-
-    delete[] buffer;
 }
 
 Mesh::Mesh(float* verticesWithNormals, int vertCount, unsigned int* indices, int idxCount, bool hasNormals) {
@@ -113,9 +113,9 @@ Mesh::Mesh(float* verticesWithNormals, int vertCount, unsigned int* indices, int
     glBindVertexArray(0);
 }
 
-Mesh* Mesh::createVertexColored(const float* verts, int vertCount,
-                                const unsigned int* indices, int idxCount) {
-    Mesh* m = new Mesh();
+std::unique_ptr<Mesh> Mesh::createVertexColored(const float* verts, int vertCount,
+                                                const unsigned int* indices, int idxCount) {
+    std::unique_ptr<Mesh> m(new Mesh());
     m->indexCount = idxCount;
     m->texture = nullptr;
     m->color = glm::vec3(1.0f);

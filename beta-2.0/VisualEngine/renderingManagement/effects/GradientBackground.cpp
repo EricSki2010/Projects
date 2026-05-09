@@ -2,16 +2,17 @@
 #include "GradientShaders.h"
 #include "../render.h"
 #include "../../EngineGlobals.h"
+#include <memory>
 
 static unsigned int sGradVAO = 0;
 static unsigned int sGradVBO = 0;
-static Shader* sGradShader = nullptr;
+static std::unique_ptr<Shader> sGradShader;
 static bool sEnabled = false;
 static glm::vec3 sTopColor = glm::vec3(0.0f);
 static glm::vec3 sBottomColor = glm::vec3(0.7f);
 
 void initGradientBackground() {
-    sGradShader = new Shader(gradientVertSrc, gradientFragSrc);
+    sGradShader = std::make_unique<Shader>(gradientVertSrc, gradientFragSrc);
 
     // Fullscreen quad
     float verts[] = {
@@ -36,8 +37,7 @@ void initGradientBackground() {
 void cleanupGradientBackground() {
     if (sGradVAO) { glDeleteVertexArrays(1, &sGradVAO); sGradVAO = 0; }
     if (sGradVBO) { glDeleteBuffers(1, &sGradVBO); sGradVBO = 0; }
-    delete sGradShader;
-    sGradShader = nullptr;
+    sGradShader.reset();
 }
 
 void setGradientColors(const glm::vec3& top, const glm::vec3& bottom) {

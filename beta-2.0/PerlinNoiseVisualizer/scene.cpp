@@ -8,6 +8,7 @@
 #include <glm/glm.hpp>
 #include <algorithm>
 #include <limits>
+#include <memory>
 #include <vector>
 
 static const int   GRID                 = 100;
@@ -22,7 +23,7 @@ static const int   CHUNKS_PER_FRAME      = 1;
 static const int CHUNKS_PER_AXIS = (GRID + kChunkSize - 1) / kChunkSize;
 static std::vector<glm::ivec3> sPendingChunks; // chunk coords still to fill
 
-static void onEnter(void*) {
+static void onEnter(std::shared_ptr<void>) {
     VE::setCamera(GRID * 1.5f, GRID * 1.2f, GRID * 1.5f, 225.0f, -25.0f);
     VE::setMoveSpeed(25.0f);
     VE::setGradientBackground(true,
