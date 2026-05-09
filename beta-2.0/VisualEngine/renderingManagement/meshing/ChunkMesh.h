@@ -30,9 +30,19 @@ struct DrawInstance {
 };
 
 struct MergedMeshEntry {
-    std::unique_ptr<Mesh> mesh;
+    std::shared_ptr<Mesh> mesh;
     std::shared_ptr<Texture> texture;
 };
+
+// CHUNK mode parameters. Chunks partition world space into kChunkSize^3 cells.
+constexpr int kChunkSize = 16;
+
+inline glm::ivec3 chunkCoordOf(const glm::ivec3& p) {
+    auto fd = [](int a, int b) {
+        return (a >= 0) ? (a / b) : -((-a + b - 1) / b);
+    };
+    return { fd(p.x, kChunkSize), fd(p.y, kChunkSize), fd(p.z, kChunkSize) };
+}
 
 void registerMesh(const char* name, const VE::MeshDef& def);
 void registerMeshFromFile(const char* name, const char* meshFilePath);
@@ -43,6 +53,7 @@ void clearDrawInstances();
 std::vector<MergedMeshEntry> buildMergedMeshes();  // CHUNK mode: face culling + merge
 std::vector<MergedMeshEntry> buildSingleMeshes();  // SINGLE mode: full meshes, no culling
 void clearMeshData();
+void reserveCullCacheCapacity(int approximateBlocks);
 const RegisteredMesh* getRegisteredMesh(const char* name);
 void setPaintPalette(const glm::vec3* palette, int count);
 const glm::vec3* getPaintPalette();
@@ -76,7 +87,7 @@ using FaceCullSet = std::unordered_set<FaceKey, FaceKeyHash>;
 // Returns false if `rotation` is not a multiple of 90 degrees on each axis.
 bool buildFaceRotMap(const glm::vec3& rotation, int rotMap[6]);
 
-// Walks gDrawList + registered face states, computes which (pos, worldFace)
-// pairs are hidden by adjacent neighbors. Same logic that buildSingleMeshes
-// uses internally; exposed so the exporter can reuse it.
-FaceCullSet computeFaceCullSet();
+// Walks all chunk-bucketed instances + registered face states, computes which
+// (pos, worldFace) pairs are hidden by adjacent neighbors. Same logic that
+// buildSingleMeshes uses internally; exposed so the exporter can reuse it.
+const FaceCullSet& computeFaceCullSet();

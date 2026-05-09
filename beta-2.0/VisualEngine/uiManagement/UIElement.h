@@ -30,6 +30,9 @@ struct UIElement {
     bool multiline = false;
     // When true, the text input only accepts digits, '.', and '-'.
     bool numericOnly = false;
+    // When true, the text input only accepts hex digits (0-9, a-f, A-F).
+    // Non-hex chars are silently dropped on type and paste.
+    bool hexOnly = false;
     // Caret position within inputText (0..inputText.size()). Snapped to end
     // on focus; moved by Left/Right arrows; insertions/deletions happen here.
     int caretPos = 0;

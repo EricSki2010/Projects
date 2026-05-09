@@ -42,6 +42,7 @@ bool initWindow(int width, int height, const char* title, bool maximized) {
         return false;
     }
     glfwMakeContextCurrent(ctx.window);
+    glfwSwapInterval(1); // vsync on: cap FPS to display refresh rate
     if (maximized)
         glfwMaximizeWindow(ctx.window);
     glfwGetFramebufferSize(ctx.window, &ctx.width, &ctx.height);
@@ -76,6 +77,10 @@ void setCamera(float x, float y, float z, float yaw, float pitch) {
     cam->updateDir();
 }
 
+void setMoveSpeed(float speed) {
+    getGlobalCamera()->moveSpeed = speed;
+}
+
 void loadMesh(const char* name, const MeshDef& def) {
     registerMesh(name, def);
 }
@@ -102,28 +107,42 @@ void setMode(MeshMode mode) {
     ctx.needsRebuild = true;
 }
 
+static bool sCollidersEnabled = true;
+
+void setCollidersEnabled(bool enabled) {
+    sCollidersEnabled = enabled;
+}
+
+void reserveBlockCapacity(int approximateBlocks) {
+    reserveCullCacheCapacity(approximateBlocks);
+}
+
 void draw(const char* meshName, float x, float y, float z,
           float rx, float ry, float rz) {
-    // Remove any existing collider at this position (e.g. ghost block)
-    removeCollider(x, y, z);
+    if (sCollidersEnabled) {
+        // Remove any existing collider at this position (e.g. ghost block)
+        removeCollider(x, y, z);
+    }
     addDrawInstance(meshName, x, y, z, rx, ry, rz);
-    const RegisteredMesh* reg = getRegisteredMesh(meshName);
-    if (reg)
-        addCollider(meshName, reg->vertices.data(), reg->vertexCount,
-                    reg->indices.data(), reg->indexCount, reg->rectangular, x, y, z,
-                    reg->floatsPerVertex, rx, ry, rz);
+    if (sCollidersEnabled) {
+        const RegisteredMesh* reg = getRegisteredMesh(meshName);
+        if (reg)
+            addCollider(meshName, reg->vertices.data(), reg->vertexCount,
+                        reg->indices.data(), reg->indexCount, reg->rectangular, x, y, z,
+                        reg->floatsPerVertex, rx, ry, rz);
+    }
     ctx.needsRebuild = true;
 }
 
 void undraw(float x, float y, float z) {
     removeDrawInstance(x, y, z);
-    removeCollider(x, y, z);
+    if (sCollidersEnabled) removeCollider(x, y, z);
     ctx.needsRebuild = true;
 }
 
 void clearDraws() {
     clearDrawInstances();
-    clearColliders();
+    if (sCollidersEnabled) clearColliders();
     ctx.needsRebuild = true;
 }
 
@@ -149,6 +168,11 @@ void setGradientBackground(bool enable, glm::vec3 top, glm::vec3 bottom) {
 void setBrightness(float brightness) {
     ctx.shader->use();
     glUniform1f(ctx.shader->loc("brightness"), brightness);
+}
+
+void setSpecularStrength(float strength) {
+    ctx.shader->use();
+    glUniform1f(ctx.shader->loc("specularStrength"), strength);
 }
 
 void registerScene(const std::string& name, std::function<void(void*)> onEnter,

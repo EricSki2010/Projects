@@ -19,8 +19,56 @@ static glm::vec3 rotatePoint(const glm::vec3& v, const glm::vec3& rotDeg) {
 
 // ── Mesh registry ───────────────────────────────────────────────────
 
+struct IVec3Hash {
+    size_t operator()(const glm::ivec3& v) const {
+        return std::hash<int>()(v.x) ^ (std::hash<int>()(v.y) << 10) ^ (std::hash<int>()(v.z) << 20);
+    }
+};
+
 static std::unordered_map<std::string, RegisteredMesh> gMeshes;
-static std::vector<DrawInstance> gDrawList;
+// CHUNK mode partitions instances by chunk coord; SINGLE mode iterates all values.
+static std::unordered_map<glm::ivec3, std::vector<DrawInstance>, IVec3Hash> gChunkInstances;
+
+// Per-chunk built mesh cache. Each chunk holds two mesh sets: `inner` (faces
+// whose cull state depends only on in-chunk neighbors) and `outer` (faces on
+// the chunk boundary planes whose cull state depends on adjacent chunks).
+// Dirty flags are tracked separately so a neighbor edit only forces an outer
+// rebuild — inner stays cached.
+struct ChunkBuild {
+    std::vector<MergedMeshEntry> innerMeshes;
+    std::vector<MergedMeshEntry> outerMeshes;
+    bool innerDirty = true;
+    bool outerDirty = true;
+};
+static std::unordered_map<glm::ivec3, ChunkBuild, IVec3Hash> gChunks;
+
+// Local coord within chunk in [0, kChunkSize), handling negative world coords.
+static int chunkLocal(int v) {
+    int m = v % kChunkSize;
+    return m < 0 ? m + kChunkSize : m;
+}
+
+// Mark the inner mesh of chunk(p) dirty, and mark outer dirty for every chunk
+// whose outer faces depend on p:
+//   • this chunk's own outer iff p sits on this chunk's boundary
+//   • the adjacent chunk's outer for each axis where p sits on that boundary
+static void markChunksDirtyForBlockEdit(const glm::ivec3& p) {
+    glm::ivec3 self = chunkCoordOf(p);
+    gChunks[self].innerDirty = true;
+
+    int lx = chunkLocal(p.x);
+    int ly = chunkLocal(p.y);
+    int lz = chunkLocal(p.z);
+
+    auto bumpOuter = [](const glm::ivec3& c) { gChunks[c].outerDirty = true; };
+
+    if (lx == 0)               { bumpOuter(self); bumpOuter(self + glm::ivec3(-1, 0, 0)); }
+    if (lx == kChunkSize - 1)  { bumpOuter(self); bumpOuter(self + glm::ivec3( 1, 0, 0)); }
+    if (ly == 0)               { bumpOuter(self); bumpOuter(self + glm::ivec3( 0,-1, 0)); }
+    if (ly == kChunkSize - 1)  { bumpOuter(self); bumpOuter(self + glm::ivec3( 0, 1, 0)); }
+    if (lz == 0)               { bumpOuter(self); bumpOuter(self + glm::ivec3( 0, 0,-1)); }
+    if (lz == kChunkSize - 1)  { bumpOuter(self); bumpOuter(self + glm::ivec3( 0, 0, 1)); }
+}
 // Variable-size paint palette. Size is always a multiple of 16 (one pack = 16
 // colors). Triangle paint indices are global: pack*16 + slotInPack.
 static std::vector<glm::vec3> gPaintPalette;
@@ -130,28 +178,119 @@ void registerMeshFromFile(const char* name, const char* meshFilePath) {
     gMeshes[name] = std::move(reg);
 }
 
+// ── Incremental cull-set cache ──────────────────────────────────────
+//
+// gFaceMap and gCullSet are kept in sync with gChunkInstances via the cache
+// helpers below. This lets buildMergedMeshes() skip the O(N) full-world cull
+// recompute every frame: addDrawInstance only does O(1) work per block.
+
+static const glm::vec3 kCardinalDirs[6] = {
+    {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}
+};
+static const int kOppositeFace[6] = {1, 0, 3, 2, 5, 4};
+
+static std::unordered_map<FaceKey, int, FaceKeyHash> gFaceMap; // (pos, worldFace) -> faceState
+static FaceCullSet gCullSet;                                   // hidden faces
+
+static void cacheBlockAdd(const std::string& meshName, const glm::ivec3& pos,
+                          const glm::vec3& rotation) {
+    auto mit = gMeshes.find(meshName);
+    if (mit == gMeshes.end()) return;
+    const RegisteredMesh& reg = mit->second;
+    int rotMap[6];
+    if (!buildFaceRotMap(rotation, rotMap)) return;
+    for (int f = 0; f < 6; f++) {
+        int state = reg.faceState[f];
+        if (state == 0) continue;
+        int worldFace = rotMap[f];
+        gFaceMap[{pos, worldFace}] = state;
+
+        glm::ivec3 nPos = pos + glm::ivec3(glm::round(kCardinalDirs[worldFace]));
+        int oppFace = kOppositeFace[worldFace];
+        auto nit = gFaceMap.find({nPos, oppFace});
+        if (nit == gFaceMap.end()) continue;
+        int nState = nit->second;
+        // Same rules as computeFaceCullSet: state 2 hides any state≥1 facing it.
+        if ((state == 2 && nState == 2) || (state == 1 && nState == 2))
+            gCullSet.insert({pos, worldFace});
+        if ((nState == 2 && state == 2) || (nState == 1 && state == 2))
+            gCullSet.insert({nPos, oppFace});
+    }
+}
+
+static void cacheBlockRemove(const std::string& meshName, const glm::ivec3& pos,
+                             const glm::vec3& rotation) {
+    auto mit = gMeshes.find(meshName);
+    if (mit == gMeshes.end()) return;
+    const RegisteredMesh& reg = mit->second;
+    int rotMap[6];
+    if (!buildFaceRotMap(rotation, rotMap)) return;
+    for (int f = 0; f < 6; f++) {
+        int state = reg.faceState[f];
+        if (state == 0) continue;
+        int worldFace = rotMap[f];
+        gFaceMap.erase({pos, worldFace});
+        gCullSet.erase({pos, worldFace});
+        // Neighbor's opposite face is no longer occluded by us.
+        glm::ivec3 nPos = pos + glm::ivec3(glm::round(kCardinalDirs[worldFace]));
+        int oppFace = kOppositeFace[worldFace];
+        gCullSet.erase({nPos, oppFace});
+    }
+}
+
 void addDrawInstance(const char* meshName, float x, float y, float z,
                      float rx, float ry, float rz) {
-    gDrawList.push_back({glm::vec3(x, y, z), glm::vec3(rx, ry, rz), meshName});
+    glm::ivec3 p((int)roundf(x), (int)roundf(y), (int)roundf(z));
+    glm::ivec3 c = chunkCoordOf(p);
+    glm::vec3 rot(rx, ry, rz);
+    gChunkInstances[c].push_back({glm::vec3(x, y, z), rot, meshName});
+    cacheBlockAdd(meshName, p, rot);
+    markChunksDirtyForBlockEdit(p);
 }
 
 void removeDrawInstance(float x, float y, float z) {
     glm::ivec3 target((int)roundf(x), (int)roundf(y), (int)roundf(z));
-    gDrawList.erase(
-        std::remove_if(gDrawList.begin(), gDrawList.end(), [&](const DrawInstance& d) {
+    glm::ivec3 c = chunkCoordOf(target);
+    auto it = gChunkInstances.find(c);
+    if (it == gChunkInstances.end()) return;
+    auto& bucket = it->second;
+    for (const auto& d : bucket) {
+        glm::ivec3 p((int)roundf(d.position.x), (int)roundf(d.position.y), (int)roundf(d.position.z));
+        if (p == target) cacheBlockRemove(d.meshName, target, d.rotation);
+    }
+    bucket.erase(
+        std::remove_if(bucket.begin(), bucket.end(), [&](const DrawInstance& d) {
             return glm::ivec3((int)roundf(d.position.x), (int)roundf(d.position.y), (int)roundf(d.position.z)) == target;
         }),
-        gDrawList.end()
+        bucket.end()
     );
+    if (bucket.empty()) gChunkInstances.erase(it);
+    markChunksDirtyForBlockEdit(target);
 }
 
 void clearDrawInstances() {
-    gDrawList.clear();
+    gChunkInstances.clear();
+    gChunks.clear();
+    gFaceMap.clear();
+    gCullSet.clear();
 }
 
 void clearMeshData() {
     gMeshes.clear();
-    gDrawList.clear();
+    gChunkInstances.clear();
+    gChunks.clear();
+    gFaceMap.clear();
+    gCullSet.clear();
+}
+
+void reserveCullCacheCapacity(int approximateBlocks) {
+    if (approximateBlocks <= 0) return;
+    // Each block contributes up to 6 face entries to gFaceMap and up to 6 to
+    // gCullSet (interior blocks have all 6 faces culled). Reserve generously
+    // so neither container rehashes during a fill.
+    size_t cap = (size_t)approximateBlocks * 6;
+    gFaceMap.reserve(cap);
+    gCullSet.reserve(cap);
 }
 
 const RegisteredMesh* getRegisteredMesh(const char* name) {
@@ -197,18 +336,8 @@ void registerMeshWithStates(const char* name, float* vertices, int vertexCount,
 
 // ── Face culling + mesh merging ─────────────────────────────────────
 
-struct IVec3Hash {
-    size_t operator()(const glm::ivec3& v) const {
-        return std::hash<int>()(v.x) ^ (std::hash<int>()(v.y) << 10) ^ (std::hash<int>()(v.z) << 20);
-    }
-};
-
-// Cardinal directions matching faceState indices.
-// 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
-static const glm::vec3 kCardinalDirs[6] = {
-    {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}
-};
-static const int kOppositeFace[6] = {1, 0, 3, 2, 5, 4};
+// Cardinal directions / opposite-face table are defined above near the
+// cull-set cache so addDrawInstance can use them.
 
 bool buildFaceRotMap(const glm::vec3& rotation, int rotMap[6]) {
     for (int f = 0; f < 6; f++) {
@@ -225,68 +354,44 @@ bool buildFaceRotMap(const glm::vec3& rotation, int rotMap[6]) {
     return true;
 }
 
-FaceCullSet computeFaceCullSet() {
-    // STEP 1: Collect all face entries from every instance in gDrawList,
-    // translated into world space via each instance's rotation map.
-    struct FaceEntry {
-        glm::ivec3 pos;
-        int worldFace;
-        int state;
-    };
-    std::vector<FaceEntry> faceEntries;
-
-    for (const auto& d : gDrawList) {
-        glm::ivec3 pos((int)roundf(d.position.x),
-                       (int)roundf(d.position.y),
-                       (int)roundf(d.position.z));
-        auto mit = gMeshes.find(d.meshName);
-        if (mit == gMeshes.end()) continue;
-        const RegisteredMesh& reg = mit->second;
-
-        int rotMap[6];
-        if (!buildFaceRotMap(d.rotation, rotMap)) continue; // skip non-90 rotations
-
-        for (int f = 0; f < 6; f++) {
-            int state = reg.faceState[f];
-            if (state > 0) {
-                faceEntries.push_back({pos, rotMap[f], state});
-            }
-        }
-    }
-
-    // STEP 2: For each face entry, look at its neighbor in the opposite
-    // direction. If both faces are state 2 (solid) or this side is state 1
-    // (partial) facing a neighbor's state 2, this face is hidden.
-    std::unordered_map<FaceKey, int, FaceKeyHash> faceMap;
-    for (const auto& entry : faceEntries)
-        faceMap[{entry.pos, entry.worldFace}] = entry.state;
-
-    FaceCullSet cullSet;
-    for (const auto& entry : faceEntries) {
-        glm::ivec3 neighborPos = entry.pos
-            + glm::ivec3(glm::round(kCardinalDirs[entry.worldFace]));
-        int oppFace = kOppositeFace[entry.worldFace];
-        auto nit = faceMap.find({neighborPos, oppFace});
-        if (nit == faceMap.end()) continue;
-
-        int myState = entry.state;
-        int neighborState = nit->second;
-        if (myState == 2 && neighborState == 2)
-            cullSet.insert({entry.pos, entry.worldFace});
-        if (myState == 1 && neighborState == 2)
-            cullSet.insert({entry.pos, entry.worldFace});
-    }
-
-    return cullSet;
+const FaceCullSet& computeFaceCullSet() {
+    // Returns the incrementally-maintained cull set. addDrawInstance and
+    // removeDrawInstance keep gCullSet in sync, so this is O(1) and copy-free.
+    return gCullSet;
 }
 
-std::vector<MergedMeshEntry> buildMergedMeshes() {
-    // TODO: chunk-based meshing (not yet implemented)
-    return buildSingleMeshes();
+// Determines whether a triangle's (chunk-local position, worldFd) is an outer
+// face of the chunk: a face on one of the chunk's 6 boundary planes pointing
+// outward. Used to partition emitted geometry between inner and outer meshes.
+static bool isOuterFace(const glm::ivec3& pos, int worldFd, const glm::ivec3& chunkOrigin) {
+    if (worldFd < 0 || worldFd > 5) return false;
+    int lx = pos.x - chunkOrigin.x;
+    int ly = pos.y - chunkOrigin.y;
+    int lz = pos.z - chunkOrigin.z;
+    switch (worldFd) {
+        case 0: return lx == kChunkSize - 1; // +X
+        case 1: return lx == 0;              // -X
+        case 2: return ly == kChunkSize - 1; // +Y
+        case 3: return ly == 0;              // -Y
+        case 4: return lz == kChunkSize - 1; // +Z
+        case 5: return lz == 0;              // -Z
+    }
+    return false;
 }
 
-std::vector<MergedMeshEntry> buildSingleMeshes() {
-    // Per-instance data needed for the emit phase below.
+enum class EmitFilter { All, InnerOnly, OuterOnly };
+
+// Shared emit core. Builds one or more MergedMeshEntries from `insts` (grouped
+// by meshName + paint bucket) using `cullSet` to skip hidden faces. Used by
+// both buildSingleMeshes (whole world) and buildMergedMeshes (per-chunk inner
+// and outer passes).
+static void emitMeshesForInstances(
+    const std::vector<const DrawInstance*>& insts,
+    const FaceCullSet& cullSet,
+    std::vector<MergedMeshEntry>& result,
+    EmitFilter filter = EmitFilter::All,
+    const glm::ivec3& chunkOrigin = glm::ivec3(0))
+{
     struct InstanceData {
         const DrawInstance* inst;
         std::string meshName;
@@ -294,26 +399,20 @@ std::vector<MergedMeshEntry> buildSingleMeshes() {
         bool is90Aligned;
     };
     std::vector<InstanceData> instances;
-    instances.reserve(gDrawList.size());
-    for (const auto& d : gDrawList) {
-        auto mit = gMeshes.find(d.meshName);
+    instances.reserve(insts.size());
+    for (const DrawInstance* d : insts) {
+        auto mit = gMeshes.find(d->meshName);
         if (mit == gMeshes.end()) continue;
         InstanceData idata;
-        idata.inst = &d;
-        idata.meshName = d.meshName;
-        idata.is90Aligned = buildFaceRotMap(d.rotation, idata.rotMap);
+        idata.inst = d;
+        idata.meshName = d->meshName;
+        idata.is90Aligned = buildFaceRotMap(d->rotation, idata.rotMap);
         instances.push_back(std::move(idata));
     }
 
-    // Cull set is computed by the shared helper.
-    FaceCullSet cullSet = computeFaceCullSet();
-
-    // ── STEP 3: Build meshes, skipping culled faces ──
-    std::unordered_map<std::string, std::vector<int>> meshGroups; // meshName -> instance indices
+    std::unordered_map<std::string, std::vector<int>> meshGroups;
     for (int i = 0; i < (int)instances.size(); i++)
         meshGroups[instances[i].meshName].push_back(i);
-
-    std::vector<MergedMeshEntry> result;
 
     for (const auto& [name, instIndices] : meshGroups) {
         auto mit = gMeshes.find(name);
@@ -332,7 +431,6 @@ std::vector<MergedMeshEntry> buildSingleMeshes() {
             glm::ivec3 pos((int)roundf(inst->position.x), (int)roundf(inst->position.y), (int)roundf(inst->position.z));
             const BlockCollider* col = getColliderAt(pos.x, pos.y, pos.z);
 
-            // Pre-transform vertices
             std::vector<float> instVerts(reg.vertexCount * fpv);
             for (int v = 0; v < reg.vertexCount; v++) {
                 int src = v * fpv;
@@ -365,20 +463,20 @@ std::vector<MergedMeshEntry> buildSingleMeshes() {
             for (int t = 0; t < triCount; t++) {
                 unsigned int i0 = reg.indices[t * 3], i1 = reg.indices[t * 3 + 1], i2 = reg.indices[t * 3 + 2];
 
-                // Map triangle's face direction to world space
                 int fd = (t < (int)reg.triFaceDir.size()) ? reg.triFaceDir[t] : -1;
                 int worldFd = (idata.is90Aligned && fd >= 0 && fd < 6) ? idata.rotMap[fd] : fd;
 
-                // Check cull set
                 if (worldFd >= 0 && worldFd < 6) {
                     if (cullSet.count({pos, worldFd}))
                         continue;
                 }
 
-                // Paint color. For rectangular meshes triColors has 6 entries
-                // (one per cardinal face direction, matching the raycast face
-                // index the paint tool writes to). For non-rectangular meshes
-                // it has one entry per triangle.
+                if (filter != EmitFilter::All) {
+                    bool outer = isOuterFace(pos, worldFd, chunkOrigin);
+                    if (filter == EmitFilter::InnerOnly && outer) continue;
+                    if (filter == EmitFilter::OuterOnly && !outer) continue;
+                }
+
                 int16_t colorIdx = -1;
                 int colorLookup = reg.rectangular ? fd : t;
                 if (col && colorLookup >= 0 && colorLookup < (int)col->triColors.size())
@@ -392,27 +490,103 @@ std::vector<MergedMeshEntry> buildSingleMeshes() {
         }
 
         if (!verts.empty()) {
-            std::unique_ptr<Mesh> mesh;
+            std::shared_ptr<Mesh> mesh;
             if (fpv == 8)
-                mesh = std::make_unique<Mesh>(verts.data(), (int)(verts.size() / 8), indices.data(), (int)indices.size(), true);
+                mesh = std::make_shared<Mesh>(verts.data(), (int)(verts.size() / 8), indices.data(), (int)indices.size(), true);
             else
-                mesh = std::make_unique<Mesh>(verts.data(), (int)(verts.size() / 5), indices.data(), (int)indices.size());
+                mesh = std::make_shared<Mesh>(verts.data(), (int)(verts.size() / 5), indices.data(), (int)indices.size());
             if (reg.texture) mesh->setTexture(reg.texture.get());
-            result.push_back({std::move(mesh), reg.texture});
+            result.push_back({mesh, reg.texture});
         }
 
         for (int c = 0; c < (int)paintBuckets.size(); c++) {
             auto& pb = paintBuckets[c];
             if (pb.verts.empty()) continue;
-            std::unique_ptr<Mesh> mesh;
+            std::shared_ptr<Mesh> mesh;
             if (fpv == 8)
-                mesh = std::make_unique<Mesh>(pb.verts.data(), (int)(pb.verts.size() / 8), pb.indices.data(), (int)pb.indices.size(), true);
+                mesh = std::make_shared<Mesh>(pb.verts.data(), (int)(pb.verts.size() / 8), pb.indices.data(), (int)pb.indices.size(), true);
             else
-                mesh = std::make_unique<Mesh>(pb.verts.data(), (int)(pb.verts.size() / 5), pb.indices.data(), (int)pb.indices.size());
+                mesh = std::make_shared<Mesh>(pb.verts.data(), (int)(pb.verts.size() / 5), pb.indices.data(), (int)pb.indices.size());
             mesh->setColor(gPaintPalette[c]);
-            result.push_back({std::move(mesh), nullptr});
+            result.push_back({mesh, nullptr});
+        }
+    }
+}
+
+std::vector<MergedMeshEntry> buildSingleMeshes() {
+    // SINGLE mode: rebuilds the full world every call. No caching.
+    std::vector<const DrawInstance*> allInsts;
+    for (const auto& [chunkCoord, bucket] : gChunkInstances)
+        for (const auto& d : bucket)
+            allInsts.push_back(&d);
+
+    const FaceCullSet& cullSet = computeFaceCullSet();
+
+    std::vector<MergedMeshEntry> result;
+    emitMeshesForInstances(allInsts, cullSet, result);
+    return result;
+}
+
+std::vector<MergedMeshEntry> buildMergedMeshes() {
+    // CHUNK mode: each chunk has separate inner / outer mesh sets and dirty
+    // flags. Clean halves keep their cached shared_ptr<Mesh> across rebuild()
+    // calls. Inner faces depend only on in-chunk neighbors; outer faces depend
+    // on adjacent-chunk neighbors. See markChunksDirtyForBlockEdit for the
+    // partition rule.
+    const FaceCullSet& cullSet = computeFaceCullSet();
+
+    // Track any chunk that has instances but no entry yet (e.g. after a mode
+    // switch wiped gChunks). Default ChunkBuild has both halves dirty.
+    for (const auto& [chunkCoord, bucket] : gChunkInstances)
+        gChunks.try_emplace(chunkCoord);
+
+    // Drop entries for chunks whose instance bucket is gone — otherwise their
+    // stale meshes would still be aggregated into the render list.
+    for (auto it = gChunks.begin(); it != gChunks.end();) {
+        if (gChunkInstances.find(it->first) == gChunkInstances.end())
+            it = gChunks.erase(it);
+        else
+            ++it;
+    }
+
+    for (auto& [chunkCoord, build] : gChunks) {
+        if (!build.innerDirty && !build.outerDirty) continue;
+
+        const auto bit = gChunkInstances.find(chunkCoord);
+        if (bit == gChunkInstances.end()) {
+            build.innerMeshes.clear();
+            build.outerMeshes.clear();
+            build.innerDirty = false;
+            build.outerDirty = false;
+            continue;
+        }
+
+        std::vector<const DrawInstance*> chunkInsts;
+        chunkInsts.reserve(bit->second.size());
+        for (const auto& d : bit->second) chunkInsts.push_back(&d);
+
+        glm::ivec3 chunkOrigin = chunkCoord * kChunkSize;
+
+        if (build.innerDirty) {
+            build.innerMeshes.clear();
+            emitMeshesForInstances(chunkInsts, cullSet, build.innerMeshes,
+                                   EmitFilter::InnerOnly, chunkOrigin);
+            build.innerDirty = false;
+        }
+        if (build.outerDirty) {
+            build.outerMeshes.clear();
+            emitMeshesForInstances(chunkInsts, cullSet, build.outerMeshes,
+                                   EmitFilter::OuterOnly, chunkOrigin);
+            build.outerDirty = false;
         }
     }
 
+    // Aggregate every chunk's cached inner + outer meshes into the flat list
+    // the renderer consumes. shared_ptr makes this cheap (refcount bump only).
+    std::vector<MergedMeshEntry> result;
+    for (const auto& [chunkCoord, build] : gChunks) {
+        for (const auto& entry : build.innerMeshes) result.push_back(entry);
+        for (const auto& entry : build.outerMeshes) result.push_back(entry);
+    }
     return result;
 }

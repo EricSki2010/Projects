@@ -16,6 +16,7 @@ struct BlockTypeDef {
     std::vector<unsigned int> indices;
     int indexCount = 0;
     std::vector<FaceColor> faceColors; // one per triangle (indexCount / 3)
+    std::string texturePath;           // optional image path applied via UVs; empty = none
 };
 
 struct BlockPlacement {

@@ -1057,6 +1057,7 @@ void register3dModelerScene() {
 
                                             UIElement hexInput = createTextInput("color_hex",
                                                 btnX, y, hexW, btnH, inputColor, "Hex", 6);
+                                            hexInput.hexOnly = true;
                                             if (!isDefault) hexInput.inputText = hexBuf;
                                             addToGroup("color_edit", hexInput);
 
@@ -1074,25 +1075,40 @@ void register3dModelerScene() {
                                             [closeColorEdit]() {
                                                 float r = 0, g = 0, b = 0, bri = 1.0f;
 
+                                                auto safeParseByte = [](const std::string& s, float fallback) -> float {
+                                                    if (s.empty()) return fallback;
+                                                    try {
+                                                        return std::clamp(std::stof(s) / 255.0f, 0.0f, 1.0f);
+                                                    } catch (const std::exception&) {
+                                                        return fallback;
+                                                    }
+                                                };
                                                 if (sColorMode == 0) {
                                                     std::string rS = getInputText("color_edit", "color_r");
                                                     std::string gS = getInputText("color_edit", "color_g");
                                                     std::string bS = getInputText("color_edit", "color_b");
                                                     std::string brS = getInputText("color_edit", "color_br");
-                                                    r = rS.empty() ? 0.0f : std::clamp(std::stof(rS) / 255.0f, 0.0f, 1.0f);
-                                                    g = gS.empty() ? 0.0f : std::clamp(std::stof(gS) / 255.0f, 0.0f, 1.0f);
-                                                    b = bS.empty() ? 0.0f : std::clamp(std::stof(bS) / 255.0f, 0.0f, 1.0f);
-                                                    bri = brS.empty() ? 1.0f : std::clamp(std::stof(brS) / 255.0f, 0.0f, 1.0f);
+                                                    r = safeParseByte(rS, 0.0f);
+                                                    g = safeParseByte(gS, 0.0f);
+                                                    b = safeParseByte(bS, 0.0f);
+                                                    bri = safeParseByte(brS, 1.0f);
                                                 } else if (sColorMode == 1) {
                                                     std::string hex = getInputText("color_edit", "color_hex");
                                                     std::string brS = getInputText("color_edit", "color_hex_br");
                                                     if (hex.size() == 6) {
-                                                        unsigned int val = std::stoul(hex, nullptr, 16);
-                                                        r = ((val >> 16) & 0xFF) / 255.0f;
-                                                        g = ((val >> 8) & 0xFF) / 255.0f;
-                                                        b = (val & 0xFF) / 255.0f;
+                                                        try {
+                                                            size_t consumed = 0;
+                                                            unsigned int val = std::stoul(hex, &consumed, 16);
+                                                            if (consumed == 6) {
+                                                                r = ((val >> 16) & 0xFF) / 255.0f;
+                                                                g = ((val >> 8) & 0xFF) / 255.0f;
+                                                                b = (val & 0xFF) / 255.0f;
+                                                            }
+                                                        } catch (const std::exception&) {
+                                                            // Unparseable hex — leave r/g/b at 0.
+                                                        }
                                                     }
-                                                    bri = brS.empty() ? 1.0f : std::clamp(std::stof(brS) / 255.0f, 0.0f, 1.0f);
+                                                    bri = safeParseByte(brS, 1.0f);
                                                 }
 
                                                 if (sSelectedColor >= 0 && sSelectedColor < (int)sColorWheel.size())
@@ -1208,7 +1224,7 @@ void register3dModelerScene() {
                             def.vertexCount = bt.vertexCount;
                             def.indices = const_cast<unsigned int*>(bt.indices.data());
                             def.indexCount = bt.indexCount;
-                            def.texturePath = nullptr;
+                            def.texturePath = bt.texturePath.empty() ? nullptr : bt.texturePath.c_str();
                             VE::loadMesh(bt.name.c_str(), def);
                         }
                     }

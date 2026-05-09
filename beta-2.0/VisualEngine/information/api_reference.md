@@ -66,6 +66,9 @@ VisualEngine/
 `VE::setBrightness(brightness)`
   Sets global brightness multiplier for the 3D shader. 1.0 = normal, lower = darker, higher = brighter. Does not affect UI.
 
+`VE::setSpecularStrength(strength)`
+  Sets the specular highlight strength for the 3D shader. Default is 0.5 (set in `Scene` constructor); lower values reduce glare/shininess, 0.0 gives a fully matte look. Does not affect UI. Like `setBrightness`, this writes directly to the active shader uniform — `RenderLoop::render()` does not reset it each frame, so the value persists until changed.
+
 `VE::setGradientBackground(enable, top = {0,0,0}, bottom = {0.7,0.7,0.7})`
   Enables/disables a 3D gradient background that follows the camera view direction. Top color when looking up, bottom color when looking down.
 

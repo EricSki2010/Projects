@@ -561,6 +561,9 @@ static bool insertCharAtCaret(UIElement* input, char c) {
     if (input->numericOnly) {
         if (!((c >= '0' && c <= '9') || c == '.' || c == '-')) return false;
     }
+    if (input->hexOnly) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+    }
     input->inputText.insert(input->inputText.begin() + input->caretPos, c);
     input->caretPos++;
     return true;

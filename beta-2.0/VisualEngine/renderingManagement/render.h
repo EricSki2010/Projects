@@ -48,8 +48,8 @@ class Texture {
 public:
     unsigned int id;
 
-    Texture(const char* filepath);
-    Texture(const unsigned char* data, int dataSize);
+    Texture(const char* filepath, bool pixelated = false);
+    Texture(const unsigned char* data, int dataSize, bool pixelated = false);
     Texture(const unsigned char* pixels, int width, int height, int channels);
     ~Texture();
     Texture(const Texture&) = delete;

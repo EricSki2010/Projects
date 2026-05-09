@@ -1,0 +1,42 @@
+Perlin Noise Block-Placement Recipe
+====================================
+
+Sampler: 3D Perlin (stb_perlin), base seed = 0, scale = 0.1
+Grid:    100 x 100 x 100  (y range: 0..99)
+
+Two noise fields are sampled per cell:
+    primary   = perlin3D(x*0.1, y*0.1, z*0.1, seed = base)
+    secondary = perlin3D(x*0.1, y*0.1, z*0.1, seed = base + 100)
+
+Rule:
+    For each cell (x, y, z):
+        // 1) Secondary gate picks the base threshold.
+        if secondary > -0.05:
+            threshold = -0.25     (loose -- denser placement)
+        else:
+            threshold = -0.15     (default)
+
+        // 2) Height gradient: bottom gets a nerf (sparser),
+        //    top gets a boost (denser), linear in between.
+        t = y / 99
+        threshold += lerp(+0.3, -0.3, t)
+                  =  +0.3 at y=0
+                  =   0.0 at y=49.5
+                  =  -0.3 at y=99
+
+        // 3) Place a block if primary clears the modified threshold.
+        if primary > threshold  ->  place block
+        else                    ->  empty
+
+Net effect:
+- Lower y -> fewer blocks (sparse near the floor).
+- Higher y -> more blocks (denser near the top, sky-island-like).
+- Secondary field still carves denser pockets within that gradient.
+
+Constants in scene.cpp:
+    NOISE_THRESHOLD          = -0.15f   (default cutoff)
+    NOISE_THRESHOLD_LOOSE    = -0.25f   (cutoff when secondary gate passes)
+    SECONDARY_GATE           = -0.05f   (secondary must exceed this)
+    SECONDARY_SEED_OFFSET    = 100      (offset added to base seed)
+    HEIGHT_MOD_BOTTOM        =  0.3f    (threshold delta at y = 0)
+    HEIGHT_MOD_TOP           = -0.3f    (threshold delta at y = 99)

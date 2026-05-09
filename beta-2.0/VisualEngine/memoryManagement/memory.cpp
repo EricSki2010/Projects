@@ -266,10 +266,12 @@ bool saveModel(const std::string& name, const ModelFile& model) {
     }
 
     // Magic + version
+    // v5: per-block-type texturePath string, written after indices and before
+    //     the per-triangle face colors.
     // v4: triColors are int16_t (was int8_t in v3), palette is variable-size
     //     (u32 count + count*vec3) so multi-pack paint palettes can persist.
     out.write("MDL", 3);
-    uint8_t version = 4;
+    uint8_t version = 5;
     out.write(reinterpret_cast<const char*>(&version), 1);
 
     // Block types section
@@ -285,6 +287,9 @@ bool saveModel(const std::string& name, const ModelFile& model) {
 
         // Indices
         for (unsigned int idx : bt.indices) writeU32(out, idx);
+
+        // Texture path (v5+; empty string = no texture)
+        writeString(out, bt.texturePath);
 
         // Face colors (one per triangle)
         uint32_t triCount = bt.indexCount / 3;
@@ -367,6 +372,12 @@ bool loadModel(const std::string& name, ModelFile& model) {
         bt.indices.resize(bt.indexCount);
         for (int i = 0; i < bt.indexCount; i++)
             bt.indices[i] = readU32(in);
+
+        if (version >= 5) {
+            bt.texturePath = readString(in);
+        } else {
+            bt.texturePath.clear();
+        }
 
         uint32_t triCount = readU32(in);
         bt.faceColors.resize(triCount);

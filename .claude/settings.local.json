@@ -4,7 +4,9 @@
       "Bash(ls -lh \"e:\\\\Code\\\\eric\\\\V2/beta-1.0/src/mapCreatorV2\"/*)",
       "Read(//e//**)",
       "Bash(vcpkg list:*)",
-      "Bash(conan search:*)"
+      "Bash(conan search:*)",
+      "Bash(cmake --build . --config Release --target modelEditor)",
+      "PowerShell(Get-WmiObject Win32_VideoController)"
     ]
   }
 }

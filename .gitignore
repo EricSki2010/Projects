@@ -26,3 +26,5 @@ ai_enabled.txt
 # Python
 __pycache__/
 *.pyc
+
+# Local test scratch

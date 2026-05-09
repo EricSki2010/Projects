@@ -15,10 +15,29 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <algorithm>
+
+// Single-header impl is in TexturePacking.cpp; here we just need declarations.
+#include <stb_image_write.h>
 
 using json = nlohmann::json;
 
 static const glm::vec3 kUnpaintedColor(0.8f);
+
+// Engine palette values are sRGB-equivalent (the editor's shader writes them
+// straight to the framebuffer with no gamma conversion). glTF COLOR_0 must be
+// linear, so vertex-color emit paths convert via this helper. The atlas
+// (baseColorTexture) keeps raw bytes since glTF treats those as sRGB-encoded
+// already, which round-trips back to the editor's appearance.
+static glm::vec3 srgbToLinear(const glm::vec3& c) {
+    auto f = [](float x) {
+        if (x <= 0.0f) return 0.0f;
+        if (x >= 1.0f) return 1.0f;
+        if (x <= 0.04045f) return x / 12.92f;
+        return std::pow((x + 0.055f) / 1.055f, 2.4f);
+    };
+    return glm::vec3(f(c.r), f(c.g), f(c.b));
+}
 
 static glm::vec3 rotatePoint(const glm::vec3& v, const glm::vec3& rotDeg) {
     if (rotDeg.x == 0.0f && rotDeg.y == 0.0f && rotDeg.z == 0.0f) return v;
@@ -48,6 +67,7 @@ static void addTriangle(VertexColorPrim& p,
                         const glm::vec3& v0, const glm::vec3& v1, const glm::vec3& v2,
                         const glm::vec3& normal,
                         const glm::vec3& color) {
+    glm::vec3 lin = srgbToLinear(color);
     uint32_t base = (uint32_t)(p.positions.size() / 3);
     auto push = [&](const glm::vec3& v) {
         p.positions.push_back(v.x);
@@ -56,9 +76,9 @@ static void addTriangle(VertexColorPrim& p,
         p.normals.push_back(normal.x);
         p.normals.push_back(normal.y);
         p.normals.push_back(normal.z);
-        p.colors.push_back(color.r);
-        p.colors.push_back(color.g);
-        p.colors.push_back(color.b);
+        p.colors.push_back(lin.r);
+        p.colors.push_back(lin.g);
+        p.colors.push_back(lin.b);
     };
     push(v0); push(v1); push(v2);
     p.indices.push_back(base);
@@ -155,6 +175,7 @@ static void emitGreedyQuad(VertexColorPrim& prim, int faceDir, int planeIntCoord
     glm::vec3 testCross = glm::cross(c10 - c00, c11 - c00);
     bool ccwGivesOutward = glm::dot(testCross, normal) > 0.0f;
 
+    glm::vec3 lin = srgbToLinear(color);
     uint32_t base = (uint32_t)(prim.positions.size() / 3);
     auto pushVert = [&](const glm::vec3& v) {
         prim.positions.push_back(v.x);
@@ -163,9 +184,9 @@ static void emitGreedyQuad(VertexColorPrim& prim, int faceDir, int planeIntCoord
         prim.normals.push_back(normal.x);
         prim.normals.push_back(normal.y);
         prim.normals.push_back(normal.z);
-        prim.colors.push_back(color.r);
-        prim.colors.push_back(color.g);
-        prim.colors.push_back(color.b);
+        prim.colors.push_back(lin.r);
+        prim.colors.push_back(lin.g);
+        prim.colors.push_back(lin.b);
     };
 
     if (ccwGivesOutward) {
@@ -251,6 +272,283 @@ static int greedyMeshPlane(VertexColorPrim& prim, int faceDir, int planeIntCoord
         }
     }
     return quadsEmitted;
+}
+
+// ── Hybrid texture/vertex-color export ─────────────────────────────────
+//
+// After phase 1 collects each plane's cells, we run an "aggressive" merge
+// that ignores color (extending merges through any cell that exists). For
+// each resulting rect:
+//
+//   - uniform color  → one vertex-colored quad (cheapest path)
+//   - multi-color, area >= kBakeAreaThreshold
+//                    → bake per-cell colors into a patch in a global atlas;
+//                      emit one textured quad referencing the patch
+//   - multi-color, area <  kBakeAreaThreshold
+//                    → fall back to color-aware greedy on those cells
+//                      (small per-color rects with vertex colors)
+
+static constexpr int kBakeAreaThreshold = 16; // cells; tune for atlas/tri tradeoff
+static constexpr int kAtlasPadding      = 1;  // texel gutter around each patch
+
+struct AggressiveRect {
+    int uMin, uMax, vMin, vMax;
+    std::vector<int> cellPalette; // (uMax-uMin+1)*(vMax-vMin+1), v-major; -1 = unpainted
+    bool uniformColor       = false;
+    int  uniformPaletteIndex = -1;
+};
+
+static std::vector<AggressiveRect> aggressiveMeshPlane(const std::vector<GMCell>& cells) {
+    std::vector<AggressiveRect> rects;
+    if (cells.empty()) return rects;
+
+    std::unordered_map<int64_t, int> grid;
+    int uMin = INT_MAX, uMax = INT_MIN, vMin = INT_MAX, vMax = INT_MIN;
+    for (const auto& c : cells) {
+        grid[cellKey(c.u, c.v)] = c.paletteIndex;
+        if (c.u < uMin) uMin = c.u;
+        if (c.u > uMax) uMax = c.u;
+        if (c.v < vMin) vMin = c.v;
+        if (c.v > vMax) vMax = c.v;
+    }
+    std::unordered_set<int64_t> processed;
+
+    for (int v = vMin; v <= vMax; v++) {
+        for (int u = uMin; u <= uMax; u++) {
+            int64_t k = cellKey(u, v);
+            if (processed.count(k)) continue;
+            if (!grid.count(k)) continue;
+
+            // Existence-only width extension.
+            int wMax = 0;
+            for (int w = 0; u + w <= uMax; w++) {
+                int64_t kw = cellKey(u + w, v);
+                if (processed.count(kw) || !grid.count(kw)) break;
+                wMax = w + 1;
+            }
+            // Existence-only height extension.
+            int hMax = 1;
+            for (int h = 1; v + h <= vMax; h++) {
+                bool rowOk = true;
+                for (int w = 0; w < wMax; w++) {
+                    int64_t khw = cellKey(u + w, v + h);
+                    if (processed.count(khw) || !grid.count(khw)) { rowOk = false; break; }
+                }
+                if (!rowOk) break;
+                hMax = h + 1;
+            }
+
+            for (int h = 0; h < hMax; h++)
+                for (int w = 0; w < wMax; w++)
+                    processed.insert(cellKey(u + w, v + h));
+
+            AggressiveRect r;
+            r.uMin = u;       r.uMax = u + wMax - 1;
+            r.vMin = v;       r.vMax = v + hMax - 1;
+            r.cellPalette.resize(wMax * hMax);
+            int firstColor = grid[cellKey(u, v)];
+            bool uniform = true;
+            for (int h = 0; h < hMax; h++) {
+                for (int w = 0; w < wMax; w++) {
+                    int c = grid[cellKey(u + w, v + h)];
+                    r.cellPalette[h * wMax + w] = c;
+                    if (c != firstColor) uniform = false;
+                }
+            }
+            r.uniformColor        = uniform;
+            r.uniformPaletteIndex = uniform ? firstColor : -1;
+            rects.push_back(std::move(r));
+        }
+    }
+    return rects;
+}
+
+struct BakeRegion {
+    int faceDir;
+    int planeIntCoord;
+    int uMin, uMax, vMin, vMax;
+    int width  = 0; // = uMax-uMin+1
+    int height = 0; // = vMax-vMin+1
+    std::vector<int> cellPalette;
+    int atlasX = 0, atlasY = 0;
+};
+
+// Vertex+UV primitive (no per-vertex colors). Verts are emitted four-per-quad
+// (no shared verts across textured quads) so each textured quad keeps its own
+// UV span without conflicts.
+struct TexturedPrim {
+    std::vector<float>    positions;
+    std::vector<float>    normals;
+    std::vector<float>    uvs;
+    std::vector<uint32_t> indices;
+};
+
+static void emitTexturedQuad(TexturedPrim& prim, int faceDir, int planeIntCoord,
+                             int uMin, int uMax, int vMin, int vMax,
+                             int atlasX, int atlasY, int regionW, int regionH,
+                             int atlasW, int atlasH) {
+    const FaceAxes& axes = kFaceAxes[faceDir];
+    float planeReal = planeIntCoord * 0.5f;
+    float u0 = uMin - 0.5f, u1 = uMax + 0.5f;
+    float v0 = vMin - 0.5f, v1 = vMax + 0.5f;
+
+    auto makeCorner = [&](float uu, float vv) {
+        glm::vec3 p(0.0f);
+        p[axes.normalAxis] = planeReal;
+        p[axes.uAxis]      = uu;
+        p[axes.vAxis]      = vv;
+        return p;
+    };
+    glm::vec3 c00 = makeCorner(u0, v0);
+    glm::vec3 c10 = makeCorner(u1, v0);
+    glm::vec3 c11 = makeCorner(u1, v1);
+    glm::vec3 c01 = makeCorner(u0, v1);
+
+    // glTF UVs are upper-left origin; we wrote the patch top-down so atlasY=0
+    // is the top row. The world-vMin corner therefore maps to atlasV0.
+    float au0 = (float)atlasX             / (float)atlasW;
+    float au1 = (float)(atlasX + regionW) / (float)atlasW;
+    float av0 = (float)atlasY             / (float)atlasH;
+    float av1 = (float)(atlasY + regionH) / (float)atlasH;
+
+    const glm::vec3& normal = kCardinalDirsLocal[faceDir];
+    glm::vec3 testCross = glm::cross(c10 - c00, c11 - c00);
+    bool ccwGivesOutward = glm::dot(testCross, normal) > 0.0f;
+
+    uint32_t base = (uint32_t)(prim.positions.size() / 3);
+    auto pushVert = [&](const glm::vec3& p, float uu, float vv) {
+        prim.positions.push_back(p.x);
+        prim.positions.push_back(p.y);
+        prim.positions.push_back(p.z);
+        prim.normals.push_back(normal.x);
+        prim.normals.push_back(normal.y);
+        prim.normals.push_back(normal.z);
+        prim.uvs.push_back(uu);
+        prim.uvs.push_back(vv);
+    };
+
+    if (ccwGivesOutward) {
+        pushVert(c00, au0, av0);
+        pushVert(c10, au1, av0);
+        pushVert(c11, au1, av1);
+        pushVert(c01, au0, av1);
+        prim.indices.push_back(base);
+        prim.indices.push_back(base + 1);
+        prim.indices.push_back(base + 2);
+        prim.indices.push_back(base);
+        prim.indices.push_back(base + 2);
+        prim.indices.push_back(base + 3);
+    } else {
+        pushVert(c00, au0, av0);
+        pushVert(c11, au1, av1);
+        pushVert(c10, au1, av0);
+        pushVert(c01, au0, av1);
+        prim.indices.push_back(base);
+        prim.indices.push_back(base + 1);
+        prim.indices.push_back(base + 2);
+        prim.indices.push_back(base);
+        prim.indices.push_back(base + 3);
+        prim.indices.push_back(base + 1);
+    }
+}
+
+// Shelf-pack the regions into an atlas. Updates atlasX/atlasY on each region.
+struct AtlasSize { int w, h; };
+static AtlasSize packAtlas(std::vector<BakeRegion>& regions) {
+    if (regions.empty()) return {0, 0};
+
+    std::vector<BakeRegion*> sorted;
+    sorted.reserve(regions.size());
+    for (auto& r : regions) sorted.push_back(&r);
+    std::sort(sorted.begin(), sorted.end(), [](BakeRegion* a, BakeRegion* b) {
+        return a->height > b->height;
+    });
+
+    int maxPadW = kAtlasPadding * 2;
+    int totalArea = 0;
+    for (auto* r : sorted) {
+        int padW = r->width  + kAtlasPadding * 2;
+        int padH = r->height + kAtlasPadding * 2;
+        if (padW > maxPadW) maxPadW = padW;
+        totalArea += padW * padH;
+    }
+    int width = std::max(maxPadW, (int)std::ceil(std::sqrt((double)totalArea)));
+    width = ((width + 15) / 16) * 16;
+
+    int curX = kAtlasPadding;
+    int curY = kAtlasPadding;
+    int rowH = 0;
+    for (auto* r : sorted) {
+        int padW = r->width + kAtlasPadding;
+        if (curX + padW > width) {
+            curX = kAtlasPadding;
+            curY += rowH + kAtlasPadding;
+            rowH = 0;
+        }
+        r->atlasX = curX;
+        r->atlasY = curY;
+        curX += padW;
+        if (r->height > rowH) rowH = r->height;
+    }
+    int height = curY + rowH + kAtlasPadding;
+    height = ((height + 15) / 16) * 16;
+    return { width, height };
+}
+
+// Render baked regions into an RGBA atlas, with edge-replication padding so
+// any non-NEAREST sampling at patch borders doesn't bleed in transparent
+// gutter pixels.
+static std::vector<uint8_t> renderAtlas(const std::vector<BakeRegion>& regions,
+                                        int atlasW, int atlasH,
+                                        const std::function<glm::vec3(int)>& colorForIndex) {
+    std::vector<uint8_t> pixels((size_t)atlasW * atlasH * 4, 0);
+
+    auto setPx = [&](int x, int y, const glm::vec3& c) {
+        if (x < 0 || x >= atlasW || y < 0 || y >= atlasH) return;
+        size_t idx = (size_t)(y * atlasW + x) * 4;
+        pixels[idx + 0] = (uint8_t)(std::clamp(c.r, 0.0f, 1.0f) * 255.0f);
+        pixels[idx + 1] = (uint8_t)(std::clamp(c.g, 0.0f, 1.0f) * 255.0f);
+        pixels[idx + 2] = (uint8_t)(std::clamp(c.b, 0.0f, 1.0f) * 255.0f);
+        pixels[idx + 3] = 255;
+    };
+    auto copyPx = [&](int sx, int sy, int dx, int dy) {
+        if (sx < 0 || sx >= atlasW || sy < 0 || sy >= atlasH) return;
+        if (dx < 0 || dx >= atlasW || dy < 0 || dy >= atlasH) return;
+        size_t s = (size_t)(sy * atlasW + sx) * 4;
+        size_t d = (size_t)(dy * atlasW + dx) * 4;
+        std::memcpy(&pixels[d], &pixels[s], 4);
+    };
+
+    for (const auto& r : regions) {
+        for (int hh = 0; hh < r.height; hh++) {
+            for (int ww = 0; ww < r.width; ww++) {
+                int idx = hh * r.width + ww;
+                glm::vec3 c = colorForIndex(r.cellPalette[idx]);
+                setPx(r.atlasX + ww, r.atlasY + hh, c);
+            }
+        }
+        // Edge-replicate padding.
+        for (int p = 1; p <= kAtlasPadding; p++) {
+            for (int ww = 0; ww < r.width; ww++) {
+                int sx = r.atlasX + ww;
+                copyPx(sx, r.atlasY,                sx, r.atlasY - p);
+                copyPx(sx, r.atlasY + r.height - 1, sx, r.atlasY + r.height - 1 + p);
+            }
+            for (int hh = -p; hh < r.height + p; hh++) {
+                int sy = r.atlasY + hh;
+                copyPx(r.atlasX,               sy, r.atlasX - p,               sy);
+                copyPx(r.atlasX + r.width - 1, sy, r.atlasX + r.width - 1 + p, sy);
+            }
+        }
+    }
+    return pixels;
+}
+
+// stbi_write callback: append bytes into a vector<uint8_t>.
+static void atlasPNGAppend(void* context, void* data, int size) {
+    auto* buf = static_cast<std::vector<uint8_t>*>(context);
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    buf->insert(buf->end(), bytes, bytes + size);
 }
 
 bool exportModelToGlb(const std::string& outPath) {
@@ -444,12 +742,74 @@ bool exportModelToGlb(const std::string& outPath) {
         }
     }
 
-    // ── PHASE 2: Greedy mesh each plane and emit merged quads ──
+    // ── PHASE 2: Aggressive merge → split by area → color-greedy / bake ──
+    // Each plane is first merged ignoring color. The merged rects then route:
+    //   uniform-color   → emit one vertex-colored quad
+    //   multi-color big → queue for atlas baking, emit textured quad later
+    //   multi-color sml → fall back to color-aware greedy on those cells.
+    TexturedPrim texPrim;
+    std::vector<BakeRegion> bakeRegions;
+    int bakedQuads = 0;
+
     for (auto& kv : planeGrids) {
-        int q = greedyMeshPlane(prim, kv.first.faceDir, kv.first.planeIntCoord,
-                                kv.second, colorForIndex);
-        greedyQuads += q;
-        emittedTris += q * 2;
+        int faceDir    = kv.first.faceDir;
+        int planeCoord = kv.first.planeIntCoord;
+        auto rects = aggressiveMeshPlane(kv.second);
+
+        for (auto& r : rects) {
+            int width  = r.uMax - r.uMin + 1;
+            int height = r.vMax - r.vMin + 1;
+            int area   = width * height;
+
+            if (r.uniformColor) {
+                emitGreedyQuad(prim, faceDir, planeCoord,
+                               r.uMin, r.uMax, r.vMin, r.vMax,
+                               colorForIndex(r.uniformPaletteIndex));
+                greedyQuads++;
+                emittedTris += 2;
+            } else if (area >= kBakeAreaThreshold) {
+                BakeRegion br;
+                br.faceDir       = faceDir;
+                br.planeIntCoord = planeCoord;
+                br.uMin = r.uMin; br.uMax = r.uMax;
+                br.vMin = r.vMin; br.vMax = r.vMax;
+                br.width = width; br.height = height;
+                br.cellPalette = std::move(r.cellPalette);
+                bakeRegions.push_back(std::move(br));
+            } else {
+                std::vector<GMCell> sub;
+                sub.reserve(area);
+                for (int hh = 0; hh < height; hh++) {
+                    for (int ww = 0; ww < width; ww++) {
+                        sub.push_back({r.uMin + ww, r.vMin + hh,
+                                       r.cellPalette[hh * width + ww]});
+                    }
+                }
+                int q = greedyMeshPlane(prim, faceDir, planeCoord, sub, colorForIndex);
+                greedyQuads += q;
+                emittedTris += q * 2;
+            }
+        }
+    }
+
+    // ── Pack atlas + emit textured quads ──
+    AtlasSize atlas = packAtlas(bakeRegions);
+    std::vector<uint8_t> atlasPixels;
+    std::vector<uint8_t> atlasPNG;
+    if (!bakeRegions.empty()) {
+        atlasPixels = renderAtlas(bakeRegions, atlas.w, atlas.h, colorForIndex);
+        int ok = stbi_write_png_to_func(atlasPNGAppend, &atlasPNG,
+                                        atlas.w, atlas.h, 4,
+                                        atlasPixels.data(), atlas.w * 4);
+        if (!ok) atlasPNG.clear();
+        for (const auto& r : bakeRegions) {
+            emitTexturedQuad(texPrim, r.faceDir, r.planeIntCoord,
+                             r.uMin, r.uMax, r.vMin, r.vMax,
+                             r.atlasX, r.atlasY, r.width, r.height,
+                             atlas.w, atlas.h);
+            bakedQuads++;
+            emittedTris += 2;
+        }
     }
 
     // ── PHASE 3: Per-triangle emit for everything greedy didn't consume ──
@@ -525,30 +885,37 @@ bool exportModelToGlb(const std::string& outPath) {
         }
     }
 
-    if (prim.positions.empty()) {
+    bool hasVc  = !prim.positions.empty();
+    bool hasTex = !texPrim.positions.empty() && !atlasPNG.empty();
+    if (!hasVc && !hasTex) {
         std::cerr << "[gltf] Nothing to export" << std::endl;
         return false;
     }
 
-    uint32_t vertCount = (uint32_t)(prim.positions.size() / 3);
-    uint32_t idxCount  = (uint32_t)prim.indices.size();
+    uint32_t vcVertCount  = hasVc  ? (uint32_t)(prim.positions.size()    / 3) : 0;
+    uint32_t vcIdxCount   = hasVc  ? (uint32_t)prim.indices.size()             : 0;
+    uint32_t texVertCount = hasTex ? (uint32_t)(texPrim.positions.size() / 3) : 0;
+    uint32_t texIdxCount  = hasTex ? (uint32_t)texPrim.indices.size()          : 0;
 
-    glm::vec3 minPos( std::numeric_limits<float>::max());
-    glm::vec3 maxPos(-std::numeric_limits<float>::max());
-    for (uint32_t i = 0; i < vertCount; i++) {
-        glm::vec3 v(prim.positions[i * 3],
-                    prim.positions[i * 3 + 1],
-                    prim.positions[i * 3 + 2]);
-        minPos = glm::min(minPos, v);
-        maxPos = glm::max(maxPos, v);
+    glm::vec3 vcMin( std::numeric_limits<float>::max());
+    glm::vec3 vcMax(-std::numeric_limits<float>::max());
+    glm::vec3 texMin( std::numeric_limits<float>::max());
+    glm::vec3 texMax(-std::numeric_limits<float>::max());
+    for (uint32_t i = 0; i < vcVertCount; i++) {
+        glm::vec3 v(prim.positions[i * 3], prim.positions[i * 3 + 1], prim.positions[i * 3 + 2]);
+        vcMin = glm::min(vcMin, v); vcMax = glm::max(vcMax, v);
+    }
+    for (uint32_t i = 0; i < texVertCount; i++) {
+        glm::vec3 v(texPrim.positions[i * 3], texPrim.positions[i * 3 + 1], texPrim.positions[i * 3 + 2]);
+        texMin = glm::min(texMin, v); texMax = glm::max(texMax, v);
     }
 
-    // Build the binary buffer: positions, normals, colors, indices.
+    // Build the binary buffer.
     std::vector<uint8_t> binBuffer;
     struct BufferView {
         size_t offset;
         size_t length;
-        int target; // 34962 = ARRAY_BUFFER, 34963 = ELEMENT_ARRAY_BUFFER
+        int target; // 34962=ARRAY_BUFFER, 34963=ELEMENT_ARRAY_BUFFER, 0=other (image)
     };
     std::vector<BufferView> bufferViews;
 
@@ -566,14 +933,30 @@ bool exportModelToGlb(const std::string& outPath) {
         return viewIndex;
     };
 
-    int posView   = appendBufferView(prim.positions.data(),
-                                     prim.positions.size() * sizeof(float), 34962);
-    int normView  = appendBufferView(prim.normals.data(),
-                                     prim.normals.size() * sizeof(float),   34962);
-    int colorView = appendBufferView(prim.colors.data(),
-                                     prim.colors.size() * sizeof(float),    34962);
-    int idxView   = appendBufferView(prim.indices.data(),
-                                     prim.indices.size() * sizeof(uint32_t), 34963);
+    int vcPosView = -1, vcNormView = -1, vcColorView = -1, vcIdxView = -1;
+    if (hasVc) {
+        vcPosView   = appendBufferView(prim.positions.data(),
+                                       prim.positions.size() * sizeof(float), 34962);
+        vcNormView  = appendBufferView(prim.normals.data(),
+                                       prim.normals.size() * sizeof(float),   34962);
+        vcColorView = appendBufferView(prim.colors.data(),
+                                       prim.colors.size() * sizeof(float),    34962);
+        vcIdxView   = appendBufferView(prim.indices.data(),
+                                       prim.indices.size() * sizeof(uint32_t), 34963);
+    }
+
+    int texPosView = -1, texNormView = -1, texUvView = -1, texIdxView = -1, atlasImgView = -1;
+    if (hasTex) {
+        texPosView  = appendBufferView(texPrim.positions.data(),
+                                       texPrim.positions.size() * sizeof(float), 34962);
+        texNormView = appendBufferView(texPrim.normals.data(),
+                                       texPrim.normals.size() * sizeof(float),   34962);
+        texUvView   = appendBufferView(texPrim.uvs.data(),
+                                       texPrim.uvs.size() * sizeof(float),       34962);
+        texIdxView  = appendBufferView(texPrim.indices.data(),
+                                       texPrim.indices.size() * sizeof(uint32_t), 34963);
+        atlasImgView = appendBufferView(atlasPNG.data(), atlasPNG.size(), 0);
+    }
 
     // Build glTF JSON
     json gltf;
@@ -582,79 +965,150 @@ bool exportModelToGlb(const std::string& outPath) {
     gltf["scenes"] = json::array({ {{"nodes", json::array({0})}} });
     gltf["nodes"]  = json::array({ {{"mesh", 0}} });
 
-    // Single unlit, double-sided, vertex-colored material.
-    json material;
-    material["name"] = "vertexColored";
-    material["pbrMetallicRoughness"] = {
-        {"baseColorFactor", json::array({1.0f, 1.0f, 1.0f, 1.0f})},
-        {"metallicFactor", 0.0f},
-        {"roughnessFactor", 1.0f}
-    };
-    material["doubleSided"] = true;
-    material["extensions"] = { {"KHR_materials_unlit", json::object()} };
-    gltf["materials"] = json::array({ material });
+    // Materials.
+    json materials = json::array();
+    int vcMatIndex = -1, texMatIndex = -1;
+    if (hasVc) {
+        json m;
+        m["name"] = "vertexColored";
+        m["pbrMetallicRoughness"] = {
+            {"baseColorFactor", json::array({1.0f, 1.0f, 1.0f, 1.0f})},
+            {"metallicFactor", 0.0f},
+            {"roughnessFactor", 1.0f}
+        };
+        m["doubleSided"] = true;
+        m["extensions"]  = { {"KHR_materials_unlit", json::object()} };
+        vcMatIndex = (int)materials.size();
+        materials.push_back(m);
+    }
+    if (hasTex) {
+        json m;
+        m["name"] = "bakedAtlas";
+        m["pbrMetallicRoughness"] = {
+            {"baseColorTexture", {{"index", 0}, {"texCoord", 0}}},
+            {"metallicFactor", 0.0f},
+            {"roughnessFactor", 1.0f}
+        };
+        m["doubleSided"] = true;
+        m["extensions"]  = { {"KHR_materials_unlit", json::object()} };
+        texMatIndex = (int)materials.size();
+        materials.push_back(m);
+    }
+    gltf["materials"]      = materials;
     gltf["extensionsUsed"] = json::array({"KHR_materials_unlit"});
 
     // BufferViews
     json bufferViewsJson = json::array();
     for (const auto& bv : bufferViews) {
-        bufferViewsJson.push_back({
+        json j = {
             {"buffer", 0},
             {"byteOffset", bv.offset},
-            {"byteLength", bv.length},
-            {"target", bv.target}
-        });
+            {"byteLength", bv.length}
+        };
+        if (bv.target != 0) j["target"] = bv.target;
+        bufferViewsJson.push_back(j);
     }
     gltf["bufferViews"] = bufferViewsJson;
 
-    // Accessors: position, normal, color, indices
+    // Accessors.
     json accessors = json::array();
-    int posAcc = (int)accessors.size();
-    accessors.push_back({
-        {"bufferView", posView},
-        {"componentType", 5126}, // FLOAT
-        {"count", vertCount},
-        {"type", "VEC3"},
-        {"min", json::array({minPos.x, minPos.y, minPos.z})},
-        {"max", json::array({maxPos.x, maxPos.y, maxPos.z})}
-    });
+    int vcPosAcc = -1, vcNormAcc = -1, vcColorAcc = -1, vcIdxAcc = -1;
+    if (hasVc) {
+        vcPosAcc = (int)accessors.size();
+        accessors.push_back({
+            {"bufferView", vcPosView},
+            {"componentType", 5126},
+            {"count", vcVertCount},
+            {"type", "VEC3"},
+            {"min", json::array({vcMin.x, vcMin.y, vcMin.z})},
+            {"max", json::array({vcMax.x, vcMax.y, vcMax.z})}
+        });
+        vcNormAcc = (int)accessors.size();
+        accessors.push_back({
+            {"bufferView", vcNormView}, {"componentType", 5126},
+            {"count", vcVertCount}, {"type", "VEC3"}
+        });
+        vcColorAcc = (int)accessors.size();
+        accessors.push_back({
+            {"bufferView", vcColorView}, {"componentType", 5126},
+            {"count", vcVertCount}, {"type", "VEC3"}
+        });
+        vcIdxAcc = (int)accessors.size();
+        accessors.push_back({
+            {"bufferView", vcIdxView}, {"componentType", 5125},
+            {"count", vcIdxCount}, {"type", "SCALAR"}
+        });
+    }
 
-    int normAcc = (int)accessors.size();
-    accessors.push_back({
-        {"bufferView", normView},
-        {"componentType", 5126},
-        {"count", vertCount},
-        {"type", "VEC3"}
-    });
-
-    int colorAcc = (int)accessors.size();
-    accessors.push_back({
-        {"bufferView", colorView},
-        {"componentType", 5126},
-        {"count", vertCount},
-        {"type", "VEC3"}
-    });
-
-    int idxAcc = (int)accessors.size();
-    accessors.push_back({
-        {"bufferView", idxView},
-        {"componentType", 5125}, // UNSIGNED_INT
-        {"count", idxCount},
-        {"type", "SCALAR"}
-    });
-
+    int texPosAcc = -1, texNormAcc = -1, texUvAcc = -1, texIdxAcc = -1;
+    if (hasTex) {
+        texPosAcc = (int)accessors.size();
+        accessors.push_back({
+            {"bufferView", texPosView},
+            {"componentType", 5126},
+            {"count", texVertCount},
+            {"type", "VEC3"},
+            {"min", json::array({texMin.x, texMin.y, texMin.z})},
+            {"max", json::array({texMax.x, texMax.y, texMax.z})}
+        });
+        texNormAcc = (int)accessors.size();
+        accessors.push_back({
+            {"bufferView", texNormView}, {"componentType", 5126},
+            {"count", texVertCount}, {"type", "VEC3"}
+        });
+        texUvAcc = (int)accessors.size();
+        accessors.push_back({
+            {"bufferView", texUvView}, {"componentType", 5126},
+            {"count", texVertCount}, {"type", "VEC2"}
+        });
+        texIdxAcc = (int)accessors.size();
+        accessors.push_back({
+            {"bufferView", texIdxView}, {"componentType", 5125},
+            {"count", texIdxCount}, {"type", "SCALAR"}
+        });
+    }
     gltf["accessors"] = accessors;
 
-    // One primitive, one material, COLOR_0 attribute
-    json primitive;
-    primitive["attributes"] = {
-        {"POSITION", posAcc},
-        {"NORMAL",   normAcc},
-        {"COLOR_0",  colorAcc}
-    };
-    primitive["indices"]  = idxAcc;
-    primitive["material"] = 0;
-    gltf["meshes"] = json::array({ {{"primitives", json::array({ primitive })}} });
+    // Image / Sampler / Texture (only if textured prim is present).
+    if (hasTex) {
+        gltf["images"]   = json::array({ {{"bufferView", atlasImgView},
+                                          {"mimeType", "image/png"}} });
+        // NEAREST + CLAMP_TO_EDGE so the baked atlas reads cell-perfectly and
+        // sampling at patch borders doesn't bleed across into adjacent ones.
+        gltf["samplers"] = json::array({ {
+            {"magFilter", 9728}, // NEAREST
+            {"minFilter", 9728}, // NEAREST
+            {"wrapS", 33071},    // CLAMP_TO_EDGE
+            {"wrapT", 33071}
+        } });
+        gltf["textures"] = json::array({ {{"source", 0}, {"sampler", 0}} });
+    }
+
+    // Primitives.
+    json primitives = json::array();
+    if (hasVc) {
+        json p;
+        p["attributes"] = {
+            {"POSITION", vcPosAcc},
+            {"NORMAL",   vcNormAcc},
+            {"COLOR_0",  vcColorAcc}
+        };
+        p["indices"]  = vcIdxAcc;
+        p["material"] = vcMatIndex;
+        primitives.push_back(p);
+    }
+    if (hasTex) {
+        json p;
+        p["attributes"] = {
+            {"POSITION",   texPosAcc},
+            {"NORMAL",     texNormAcc},
+            {"TEXCOORD_0", texUvAcc}
+        };
+        p["indices"]  = texIdxAcc;
+        p["material"] = texMatIndex;
+        primitives.push_back(p);
+    }
+    gltf["meshes"] = json::array({ {{"primitives", primitives}} });
 
     gltf["buffers"] = json::array({ {{"byteLength", binBuffer.size()}} });
 
@@ -689,8 +1143,14 @@ bool exportModelToGlb(const std::string& outPath) {
     out.write(reinterpret_cast<const char*>(binBuffer.data()), binChunkLen);
 
     std::cout << "[gltf] Exported " << emittedTris << " tris ("
-              << greedyQuads << " merged quads, "
+              << greedyQuads << " vc-merged, "
+              << bakedQuads << " textured, "
               << culledTris << " culled), "
-              << vertCount << " verts -> " << outPath << std::endl;
+              << (vcVertCount + texVertCount) << " verts";
+    if (hasTex) {
+        std::cout << ", atlas " << atlas.w << "x" << atlas.h
+                  << " (" << atlasPNG.size() << "B)";
+    }
+    std::cout << " -> " << outPath << std::endl;
     return true;
 }

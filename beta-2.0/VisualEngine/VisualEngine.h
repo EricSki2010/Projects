@@ -22,6 +22,9 @@ struct MeshDef {
 bool initWindow(int width, int height, const char* title, bool maximized = false);
 void setCamera(float x, float y, float z,
                float yaw, float pitch);
+void setMoveSpeed(float speed);
+void setCollidersEnabled(bool enabled);
+void reserveBlockCapacity(int approximateBlocks);
 void loadMesh(const char* name, const MeshDef& def);
 void loadMesh(const char* name, const char* meshFilePath);
 void loadMeshDir(const char* dirPath);
@@ -39,6 +42,7 @@ void registerScene(const std::string& name, std::function<void(void*)> onEnter,
                    std::function<void()> onRender);
 void setScene(const std::string& name, void* data = nullptr);
 void setBrightness(float brightness);
+void setSpecularStrength(float strength);
 void setGradientBackground(bool enable, glm::vec3 top = glm::vec3(0.0f), glm::vec3 bottom = glm::vec3(0.7f));
 void run();
 
