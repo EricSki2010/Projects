@@ -8,8 +8,11 @@
 namespace VE {
 
 enum MeshMode {
-    SINGLE,  // one mesh rendered as-is (models, props)
-    CHUNK,   // voxel grid with face culling + merging
+    SINGLE,       // one mesh rendered as-is (models, props)
+    CHUNK,        // voxel grid backed by per-block DrawInstance, supports
+                  // mixed meshes / rotations / paint-color buckets
+    CHUNK_VOXEL,  // memory-optimized voxel grid: per-chunk flat byte array,
+                  // single-mesh, no rotation. ~150x less RAM per dense chunk.
 };
 
 struct MeshDef {
@@ -44,6 +47,14 @@ void registerScene(const std::string& name, std::function<void(std::shared_ptr<v
 void setScene(const std::string& name, std::shared_ptr<void> data = nullptr);
 void setBrightness(float brightness);
 void setSpecularStrength(float strength);
+void setFog(bool enable, glm::vec3 color, float start, float end);
+void setFarPlane(float farPlane);
+// Engine-managed hotkey that cycles to the next registered scene (in registration order).
+// Triggers on rising edge so a held key only fires once. Pass key=0 to disable.
+// modKey=0 means no modifier required. If modKey is GLFW_KEY_LEFT_CONTROL or
+// GLFW_KEY_RIGHT_CONTROL (similarly SHIFT/ALT), either left/right variant satisfies it.
+void setSceneCycleHotkey(int key, int modKey = 0);
+void undrawChunkAt(int chunkX, int chunkY, int chunkZ);
 void setGradientBackground(bool enable, glm::vec3 top = glm::vec3(0.0f), glm::vec3 bottom = glm::vec3(0.7f));
 void run();
 

@@ -40,10 +40,22 @@ uniform sampler2D textureSampler;
 uniform bool useTexture;
 uniform float alpha;
 uniform float brightness;
+uniform bool fogEnabled;
+uniform vec3 fogColor;
+uniform float fogStart;
+uniform float fogEnd;
 
 out vec4 FragColor;
 
 void main() {
+    float fogDist = 0.0;
+    if (fogEnabled) {
+        vec3 fogD = viewPos - FragPos;
+        fogD.y *= 2.0; // vertical fog reaches saturation at half horizontal range
+        fogDist = length(fogD);
+        if (fogDist > fogEnd) discard;
+    }
+
     vec3 baseColor;
     if (useTexture) {
         baseColor = texture(textureSampler, TexCoord).rgb;
@@ -65,6 +77,10 @@ void main() {
 
     vec3 result = (ambient + diffuse + specular) * baseColor;
     result *= brightness;
+    if (fogEnabled) {
+        float fogFactor = smoothstep(fogStart, fogEnd, fogDist);
+        result = mix(result, fogColor, fogFactor);
+    }
     FragColor = vec4(result, alpha);
 }
 )";
@@ -110,10 +126,22 @@ uniform int shininess;
 uniform vec3 viewPos;
 uniform float alpha;
 uniform float brightness;
+uniform bool fogEnabled;
+uniform vec3 fogColor;
+uniform float fogStart;
+uniform float fogEnd;
 
 out vec4 FragColor;
 
 void main() {
+    float fogDist = 0.0;
+    if (fogEnabled) {
+        vec3 fogD = viewPos - FragPos;
+        fogD.y *= 2.0; // vertical fog reaches saturation at half horizontal range
+        fogDist = length(fogD);
+        if (fogDist > fogEnd) discard;
+    }
+
     vec3 ambient = ambientStrength * lightColor;
 
     vec3 norm = normalize(Normal);
@@ -128,6 +156,10 @@ void main() {
 
     vec3 result = (ambient + diffuse + specular) * VertColor;
     result *= brightness;
+    if (fogEnabled) {
+        float fogFactor = smoothstep(fogStart, fogEnd, fogDist);
+        result = mix(result, fogColor, fogFactor);
+    }
     FragColor = vec4(result, alpha);
 }
 )";

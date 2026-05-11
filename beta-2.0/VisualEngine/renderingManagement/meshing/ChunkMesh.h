@@ -2,6 +2,7 @@
 
 #include "../render.h"
 #include "../../VisualEngine.h"
+#include <array>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -32,6 +33,10 @@ struct DrawInstance {
 struct MergedMeshEntry {
     std::shared_ptr<Mesh> mesh;
     std::shared_ptr<Texture> texture;
+    // Optional bounding sphere for distance culling (e.g. fog cutoff). A
+    // negative radius means "no bounds, always draw" — used by SINGLE mode.
+    glm::vec3 boundsCenter = glm::vec3(0.0f);
+    float boundsRadius = -1.0f;
 };
 
 // CHUNK mode parameters. Chunks partition world space into kChunkSize^3 cells.
@@ -50,6 +55,33 @@ void addDrawInstance(const char* meshName, float x, float y, float z,
                      float rx = 0.0f, float ry = 0.0f, float rz = 0.0f);
 void removeDrawInstance(float x, float y, float z);
 void clearDrawInstances();
+// View-distance / streaming support: read or wipe a chunk's instances in bulk.
+// getChunkInstances returns nullptr if no instances exist for that chunk.
+// clearChunkInstances erases the chunk's bucket and updates the cull cache;
+// it does not touch colliders (callers handle those separately, like clearDraws).
+const std::vector<DrawInstance>* getChunkInstances(const glm::ivec3& chunkCoord);
+void clearChunkInstances(const glm::ivec3& chunkCoord);
+
+// ── CHUNK_VOXEL mode ─────────────────────────────────────────────────
+//
+// Memory-optimized voxel grid: each chunk is a flat byte array of cell
+// presence (0 = empty, non-zero = filled). No DrawInstance bucket, no
+// face-cull cache. Constraints: single rectangular mesh per scene, no
+// rotation, no per-tri paint. ~4 KB per dense chunk vs ~700 KB in CHUNK.
+constexpr int kChunkVoxelCount = kChunkSize * kChunkSize * kChunkSize;
+struct ChunkVoxels {
+    std::array<uint8_t, kChunkVoxelCount> cells{};
+    int  filledCount = 0;
+    bool dirty       = true;
+    MergedMeshEntry cachedEntry;   // greedy-built mesh, valid when !dirty
+};
+
+void     setVoxelAt(int x, int y, int z, uint8_t value);
+uint8_t  getVoxelAt(int x, int y, int z);
+bool     hasVoxelAt(int x, int y, int z);
+void     clearVoxelChunk(const glm::ivec3& chunkCoord);
+void     clearAllVoxels();
+std::vector<MergedMeshEntry> buildVoxelChunkMeshes();
 std::vector<MergedMeshEntry> buildMergedMeshes();  // CHUNK mode: face culling + merge
 std::vector<MergedMeshEntry> buildSingleMeshes();  // SINGLE mode: full meshes, no culling
 void clearMeshData();

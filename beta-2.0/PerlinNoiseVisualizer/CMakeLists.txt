@@ -10,6 +10,8 @@ add_executable(PerlinNoiseVisualizer
     main.cpp
     perlinNoiseManagement.cpp
     scene.cpp
+    noise2D.cpp
+    biome.cpp
     ../VisualEngine/VisualEngine.cpp
     ../VisualEngine/renderingManagement/Mesh.cpp
     ../VisualEngine/renderingManagement/Scene.cpp

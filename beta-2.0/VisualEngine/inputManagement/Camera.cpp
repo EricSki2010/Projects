@@ -1,4 +1,5 @@
 #include "Camera.h"
+#include "../EngineGlobals.h"
 #include "../uiManagement/UIManager.h"
 #include <cmath>
 
@@ -75,7 +76,8 @@ glm::mat4 Camera::getViewMatrix() const {
 glm::mat4 Camera::getProjectionMatrix(float aspectRatio) const {
     if (mode == CAMERA_FLAT)
         return glm::ortho(-aspectRatio, aspectRatio, -1.0f, 1.0f, -1.0f, 1.0f);
-    return glm::perspective(glm::radians(45.0f), aspectRatio, 0.1f, 500.0f);
+    float farPlane = ctx.scene ? ctx.scene->farPlane : 500.0f;
+    return glm::perspective(glm::radians(45.0f), aspectRatio, 0.1f, farPlane);
 }
 
 void Camera::mouseCallback(GLFWwindow* window, double xpos, double ypos) {

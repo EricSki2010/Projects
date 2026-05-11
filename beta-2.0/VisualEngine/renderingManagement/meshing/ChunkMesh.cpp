@@ -1,4 +1,5 @@
 #include "ChunkMesh.h"
+#include "Greedy.h"
 #include "../../inputManagement/Collision.h"
 #include <glm/gtc/matrix_transform.hpp>
 #include <unordered_set>
@@ -275,6 +276,24 @@ void clearDrawInstances() {
     gCullSet.clear();
 }
 
+const std::vector<DrawInstance>* getChunkInstances(const glm::ivec3& chunkCoord) {
+    auto it = gChunkInstances.find(chunkCoord);
+    return (it != gChunkInstances.end()) ? &it->second : nullptr;
+}
+
+void clearChunkInstances(const glm::ivec3& chunkCoord) {
+    auto it = gChunkInstances.find(chunkCoord);
+    if (it == gChunkInstances.end()) return;
+    // Drop each instance's contribution to the cull cache and dirty-mark
+    // dependent chunks (boundary blocks fan out to neighbors).
+    for (const auto& d : it->second) {
+        glm::ivec3 p((int)roundf(d.position.x), (int)roundf(d.position.y), (int)roundf(d.position.z));
+        cacheBlockRemove(d.meshName, p, d.rotation);
+        markChunksDirtyForBlockEdit(p);
+    }
+    gChunkInstances.erase(it);
+}
+
 void clearMeshData() {
     gMeshes.clear();
     gChunkInstances.clear();
@@ -513,6 +532,383 @@ static void emitMeshesForInstances(
     }
 }
 
+// ── Greedy-meshing fast path ────────────────────────────────────────
+//
+// A chunk qualifies for greedy meshing when every instance is the same
+// rectangular registered mesh with zero rotation. This catches the
+// common voxel case (all cubes, axis-aligned) and keeps the general
+// emitMeshesForInstances path for everything else (mixed meshes,
+// rotations, paint colors, non-rectangular meshes).
+//
+// Greedy ignores the inner/outer chunk split and rebuilds the whole
+// chunk as a single MergedMeshEntry whenever any dirty flag is set.
+// The merged-tri count drop more than makes up for losing the
+// inner-only/outer-only incremental rebuild.
+
+static bool canChunkUseGreedy(const std::vector<const DrawInstance*>& insts) {
+    if (insts.empty()) return false;
+    const std::string& meshName = insts[0]->meshName;
+    auto it = gMeshes.find(meshName);
+    if (it == gMeshes.end()) return false;
+    const RegisteredMesh& reg = it->second;
+    if (!reg.rectangular) return false;
+    // Per-tri paint colors break the "uniform per-face color" assumption
+    // greedy needs. Skip greedy if any instance has a collider with paint.
+    for (const DrawInstance* d : insts) {
+        if (d->meshName != meshName) return false;
+        if (d->rotation.x != 0.0f || d->rotation.y != 0.0f || d->rotation.z != 0.0f) return false;
+        glm::ivec3 p((int)roundf(d->position.x),
+                     (int)roundf(d->position.y),
+                     (int)roundf(d->position.z));
+        const BlockCollider* col = getColliderAt(p.x, p.y, p.z);
+        if (col) {
+            for (int16_t c : col->triColors)
+                if (c >= 0) return false;
+        }
+    }
+    return true;
+}
+
+static MergedMeshEntry buildGreedyChunkMesh(const std::vector<const DrawInstance*>& insts,
+                                            const FaceCullSet& cullSet) {
+    // Bucket exposed (non-culled) faces per (faceDir, planeIntCoord).
+    struct PlaneKey { int faceDir, planeIntCoord; };
+    struct PlaneKeyHash {
+        size_t operator()(const PlaneKey& k) const {
+            return (size_t)(k.faceDir * 73856093) ^ (size_t)(k.planeIntCoord * 19349663);
+        }
+    };
+    struct PlaneKeyEq {
+        bool operator()(const PlaneKey& a, const PlaneKey& b) const {
+            return a.faceDir == b.faceDir && a.planeIntCoord == b.planeIntCoord;
+        }
+    };
+    std::unordered_map<PlaneKey, std::vector<VEGreedy::GMCell>, PlaneKeyHash, PlaneKeyEq> planes;
+
+    for (const DrawInstance* d : insts) {
+        glm::ivec3 pos((int)roundf(d->position.x),
+                       (int)roundf(d->position.y),
+                       (int)roundf(d->position.z));
+        for (int faceDir = 0; faceDir < 6; faceDir++) {
+            // Zero rotation → world face == local face direction.
+            if (cullSet.count({pos, faceDir})) continue;
+            int planeCoord = VEGreedy::planeIntCoordFor(faceDir, pos);
+            const VEGreedy::FaceAxes& axes = VEGreedy::kFaceAxes[faceDir];
+            VEGreedy::GMCell cell;
+            cell.u = pos[axes.uAxis];
+            cell.v = pos[axes.vAxis];
+            cell.paletteIndex = 0; // uniform color across the chunk
+            planes[{faceDir, planeCoord}].push_back(cell);
+        }
+    }
+
+    // Emit merged quads as pos(3) + uv(2) + normal(3) = 8 floats per vert.
+    std::vector<float> verts;
+    std::vector<unsigned int> indices;
+
+    auto emitQuad = [&](int faceDir, int planeIntCoord,
+                        int uMin, int uMax, int vMin, int vMax,
+                        int /*paletteIndex*/) {
+        const VEGreedy::FaceAxes& axes = VEGreedy::kFaceAxes[faceDir];
+        float planeReal = planeIntCoord * 0.5f;
+        float u0 = (float)uMin - 0.5f, u1 = (float)uMax + 0.5f;
+        float v0 = (float)vMin - 0.5f, v1 = (float)vMax + 0.5f;
+
+        auto makeCorner = [&](float uu, float vv) {
+            glm::vec3 p(0.0f);
+            p[axes.normalAxis] = planeReal;
+            p[axes.uAxis]      = uu;
+            p[axes.vAxis]      = vv;
+            return p;
+        };
+        glm::vec3 c00 = makeCorner(u0, v0);
+        glm::vec3 c10 = makeCorner(u1, v0);
+        glm::vec3 c11 = makeCorner(u1, v1);
+        glm::vec3 c01 = makeCorner(u0, v1);
+
+        const glm::vec3& normal = VEGreedy::kCardinalDirs[faceDir];
+        glm::vec3 testCross = glm::cross(c10 - c00, c11 - c00);
+        bool ccwGivesOutward = glm::dot(testCross, normal) > 0.0f;
+
+        unsigned int base = (unsigned int)(verts.size() / 8);
+        auto pushVert = [&](const glm::vec3& p, float uu, float vv) {
+            verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
+            verts.push_back(uu);  verts.push_back(vv);
+            verts.push_back(normal.x); verts.push_back(normal.y); verts.push_back(normal.z);
+        };
+
+        if (ccwGivesOutward) {
+            pushVert(c00, 0.0f, 0.0f);
+            pushVert(c10, 1.0f, 0.0f);
+            pushVert(c11, 1.0f, 1.0f);
+            pushVert(c01, 0.0f, 1.0f);
+            indices.push_back(base);
+            indices.push_back(base + 1);
+            indices.push_back(base + 2);
+            indices.push_back(base);
+            indices.push_back(base + 2);
+            indices.push_back(base + 3);
+        } else {
+            pushVert(c00, 0.0f, 0.0f);
+            pushVert(c11, 1.0f, 1.0f);
+            pushVert(c10, 1.0f, 0.0f);
+            pushVert(c01, 0.0f, 1.0f);
+            indices.push_back(base);
+            indices.push_back(base + 1);
+            indices.push_back(base + 2);
+            indices.push_back(base);
+            indices.push_back(base + 3);
+            indices.push_back(base + 1);
+        }
+    };
+
+    for (const auto& [key, cells] : planes) {
+        VEGreedy::greedyMeshPlane(key.faceDir, key.planeIntCoord, cells, emitQuad);
+    }
+
+    if (verts.empty()) return MergedMeshEntry{};
+    auto mesh = std::make_shared<Mesh>(verts.data(), (int)(verts.size() / 8),
+                                       indices.data(), (int)indices.size(), true);
+    return MergedMeshEntry{mesh, nullptr};
+}
+
+// ── CHUNK_VOXEL storage ────────────────────────────────────────────────
+
+static std::unordered_map<glm::ivec3, ChunkVoxels, IVec3Hash> gChunkVoxels;
+
+static int voxelLocalIdx(int lx, int ly, int lz) {
+    return (lz * kChunkSize + ly) * kChunkSize + lx;
+}
+
+static void markVoxelChunkDirty(const glm::ivec3& c) {
+    auto it = gChunkVoxels.find(c);
+    if (it != gChunkVoxels.end()) it->second.dirty = true;
+}
+
+void setVoxelAt(int x, int y, int z, uint8_t value) {
+    glm::ivec3 c = chunkCoordOf({x, y, z});
+    int lx = chunkLocal(x), ly = chunkLocal(y), lz = chunkLocal(z);
+    auto& vox = gChunkVoxels[c];  // creates if missing
+    int idx = voxelLocalIdx(lx, ly, lz);
+    uint8_t old = vox.cells[idx];
+    if (old == value) return;
+    vox.cells[idx] = value;
+    if (old == 0 && value != 0) vox.filledCount++;
+    if (old != 0 && value == 0) vox.filledCount--;
+    vox.dirty = true;
+
+    // A boundary cell change affects the adjacent chunk's outer-face culling.
+    if (lx == 0)              markVoxelChunkDirty(c + glm::ivec3(-1, 0, 0));
+    if (lx == kChunkSize - 1) markVoxelChunkDirty(c + glm::ivec3( 1, 0, 0));
+    if (ly == 0)              markVoxelChunkDirty(c + glm::ivec3( 0,-1, 0));
+    if (ly == kChunkSize - 1) markVoxelChunkDirty(c + glm::ivec3( 0, 1, 0));
+    if (lz == 0)              markVoxelChunkDirty(c + glm::ivec3( 0, 0,-1));
+    if (lz == kChunkSize - 1) markVoxelChunkDirty(c + glm::ivec3( 0, 0, 1));
+
+    if (vox.filledCount == 0) gChunkVoxels.erase(c);
+}
+
+uint8_t getVoxelAt(int x, int y, int z) {
+    glm::ivec3 c = chunkCoordOf({x, y, z});
+    auto it = gChunkVoxels.find(c);
+    if (it == gChunkVoxels.end()) return 0;
+    return it->second.cells[voxelLocalIdx(chunkLocal(x), chunkLocal(y), chunkLocal(z))];
+}
+
+bool hasVoxelAt(int x, int y, int z) {
+    return getVoxelAt(x, y, z) != 0;
+}
+
+void clearVoxelChunk(const glm::ivec3& chunkCoord) {
+    if (!gChunkVoxels.erase(chunkCoord)) return;
+    // Adjacent chunks' outer faces depended on us; force them to rebuild.
+    static const glm::ivec3 kNb[6] = {
+        { 1, 0, 0}, {-1, 0, 0},
+        { 0, 1, 0}, { 0,-1, 0},
+        { 0, 0, 1}, { 0, 0,-1},
+    };
+    for (const auto& off : kNb) markVoxelChunkDirty(chunkCoord + off);
+}
+
+void clearAllVoxels() {
+    gChunkVoxels.clear();
+}
+
+// Test cell presence in a possibly-different chunk. Used during voxel-mode
+// greedy meshing to decide if a face is exposed (empty neighbor → exposed).
+static bool voxelCellAt(const glm::ivec3& worldPos,
+                        const ChunkVoxels* selfVox, const glm::ivec3& selfCoord,
+                        const ChunkVoxels* nbX0, const ChunkVoxels* nbX1,
+                        const ChunkVoxels* nbY0, const ChunkVoxels* nbY1,
+                        const ChunkVoxels* nbZ0, const ChunkVoxels* nbZ1) {
+    glm::ivec3 c = chunkCoordOf(worldPos);
+    const ChunkVoxels* v = nullptr;
+    if      (c == selfCoord)                                  v = selfVox;
+    else if (c == selfCoord + glm::ivec3(-1, 0, 0))           v = nbX0;
+    else if (c == selfCoord + glm::ivec3( 1, 0, 0))           v = nbX1;
+    else if (c == selfCoord + glm::ivec3( 0,-1, 0))           v = nbY0;
+    else if (c == selfCoord + glm::ivec3( 0, 1, 0))           v = nbY1;
+    else if (c == selfCoord + glm::ivec3( 0, 0,-1))           v = nbZ0;
+    else if (c == selfCoord + glm::ivec3( 0, 0, 1))           v = nbZ1;
+    if (!v) return false; // no chunk → empty
+    int lx = chunkLocal(worldPos.x);
+    int ly = chunkLocal(worldPos.y);
+    int lz = chunkLocal(worldPos.z);
+    return v->cells[voxelLocalIdx(lx, ly, lz)] != 0;
+}
+
+// Emit one greedy quad as 4 verts (pos + uv + normal) + 6 indices into the
+// passed buffers. Shared by buildGreedyChunkMesh (CHUNK) and the per-chunk
+// build inside buildVoxelChunkMeshes (CHUNK_VOXEL).
+static void emitGreedyQuadInterleaved(int faceDir, int planeIntCoord,
+                                      int uMin, int uMax, int vMin, int vMax,
+                                      std::vector<float>& verts,
+                                      std::vector<unsigned int>& indices) {
+    const VEGreedy::FaceAxes& axes = VEGreedy::kFaceAxes[faceDir];
+    float planeReal = planeIntCoord * 0.5f;
+    float u0 = (float)uMin - 0.5f, u1 = (float)uMax + 0.5f;
+    float v0 = (float)vMin - 0.5f, v1 = (float)vMax + 0.5f;
+
+    auto makeCorner = [&](float uu, float vv) {
+        glm::vec3 p(0.0f);
+        p[axes.normalAxis] = planeReal;
+        p[axes.uAxis]      = uu;
+        p[axes.vAxis]      = vv;
+        return p;
+    };
+    glm::vec3 c00 = makeCorner(u0, v0);
+    glm::vec3 c10 = makeCorner(u1, v0);
+    glm::vec3 c11 = makeCorner(u1, v1);
+    glm::vec3 c01 = makeCorner(u0, v1);
+
+    const glm::vec3& normal = VEGreedy::kCardinalDirs[faceDir];
+    glm::vec3 testCross = glm::cross(c10 - c00, c11 - c00);
+    bool ccwGivesOutward = glm::dot(testCross, normal) > 0.0f;
+
+    unsigned int base = (unsigned int)(verts.size() / 8);
+    auto pushVert = [&](const glm::vec3& p, float uu, float vv) {
+        verts.push_back(p.x); verts.push_back(p.y); verts.push_back(p.z);
+        verts.push_back(uu);  verts.push_back(vv);
+        verts.push_back(normal.x); verts.push_back(normal.y); verts.push_back(normal.z);
+    };
+
+    if (ccwGivesOutward) {
+        pushVert(c00, 0.0f, 0.0f);
+        pushVert(c10, 1.0f, 0.0f);
+        pushVert(c11, 1.0f, 1.0f);
+        pushVert(c01, 0.0f, 1.0f);
+        indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
+        indices.push_back(base);     indices.push_back(base + 2); indices.push_back(base + 3);
+    } else {
+        pushVert(c00, 0.0f, 0.0f);
+        pushVert(c11, 1.0f, 1.0f);
+        pushVert(c10, 1.0f, 0.0f);
+        pushVert(c01, 0.0f, 1.0f);
+        indices.push_back(base);     indices.push_back(base + 1); indices.push_back(base + 2);
+        indices.push_back(base);     indices.push_back(base + 3); indices.push_back(base + 1);
+    }
+}
+
+std::vector<MergedMeshEntry> buildVoxelChunkMeshes() {
+    // Refresh cached entries for any dirty chunks, then aggregate cached
+    // entries from every chunk in gChunkVoxels.
+    const float chunkBoundsRadius = (float)kChunkSize * 0.8660254f;
+
+    for (auto& [chunkCoord, vox] : gChunkVoxels) {
+        if (!vox.dirty) continue;
+
+        // Pre-resolve the 6 neighbor pointers so the inner loop avoids hash
+        // lookups for boundary-face culling.
+        auto find = [](glm::ivec3 c) -> const ChunkVoxels* {
+            auto it = gChunkVoxels.find(c);
+            return (it != gChunkVoxels.end()) ? &it->second : nullptr;
+        };
+        const ChunkVoxels* nbX0 = find(chunkCoord + glm::ivec3(-1, 0, 0));
+        const ChunkVoxels* nbX1 = find(chunkCoord + glm::ivec3( 1, 0, 0));
+        const ChunkVoxels* nbY0 = find(chunkCoord + glm::ivec3( 0,-1, 0));
+        const ChunkVoxels* nbY1 = find(chunkCoord + glm::ivec3( 0, 1, 0));
+        const ChunkVoxels* nbZ0 = find(chunkCoord + glm::ivec3( 0, 0,-1));
+        const ChunkVoxels* nbZ1 = find(chunkCoord + glm::ivec3( 0, 0, 1));
+
+        // Bucket exposed faces into per-plane cells, then run greedy.
+        struct PlaneKey { int faceDir, planeIntCoord; };
+        struct PlaneKeyHash {
+            size_t operator()(const PlaneKey& k) const {
+                return (size_t)(k.faceDir * 73856093) ^ (size_t)(k.planeIntCoord * 19349663);
+            }
+        };
+        struct PlaneKeyEq {
+            bool operator()(const PlaneKey& a, const PlaneKey& b) const {
+                return a.faceDir == b.faceDir && a.planeIntCoord == b.planeIntCoord;
+            }
+        };
+        std::unordered_map<PlaneKey, std::vector<VEGreedy::GMCell>, PlaneKeyHash, PlaneKeyEq> planes;
+
+        glm::ivec3 origin = chunkCoord * kChunkSize;
+        static const glm::ivec3 kFaceOffset[6] = {
+            { 1, 0, 0}, {-1, 0, 0},
+            { 0, 1, 0}, { 0,-1, 0},
+            { 0, 0, 1}, { 0, 0,-1},
+        };
+        for (int lz = 0; lz < kChunkSize; lz++) {
+            for (int ly = 0; ly < kChunkSize; ly++) {
+                for (int lx = 0; lx < kChunkSize; lx++) {
+                    if (vox.cells[voxelLocalIdx(lx, ly, lz)] == 0) continue;
+                    glm::ivec3 worldPos = origin + glm::ivec3(lx, ly, lz);
+                    for (int faceDir = 0; faceDir < 6; faceDir++) {
+                        glm::ivec3 nbPos = worldPos + kFaceOffset[faceDir];
+                        bool nbFilled = voxelCellAt(nbPos,
+                                                    &vox, chunkCoord,
+                                                    nbX0, nbX1, nbY0, nbY1, nbZ0, nbZ1);
+                        if (nbFilled) continue; // covered → cull
+                        int planeCoord = VEGreedy::planeIntCoordFor(faceDir, worldPos);
+                        const VEGreedy::FaceAxes& axes = VEGreedy::kFaceAxes[faceDir];
+                        VEGreedy::GMCell cell;
+                        cell.u = worldPos[axes.uAxis];
+                        cell.v = worldPos[axes.vAxis];
+                        cell.paletteIndex = 0;
+                        planes[{faceDir, planeCoord}].push_back(cell);
+                    }
+                }
+            }
+        }
+
+        std::vector<float> verts;
+        std::vector<unsigned int> indices;
+        auto emit = [&](int faceDir, int planeIntCoord,
+                        int uMin, int uMax, int vMin, int vMax,
+                        int /*paletteIndex*/) {
+            emitGreedyQuadInterleaved(faceDir, planeIntCoord,
+                                      uMin, uMax, vMin, vMax,
+                                      verts, indices);
+        };
+        for (const auto& [key, cells] : planes)
+            VEGreedy::greedyMeshPlane(key.faceDir, key.planeIntCoord, cells, emit);
+
+        if (verts.empty()) {
+            vox.cachedEntry = MergedMeshEntry{};
+        } else {
+            auto mesh = std::make_shared<Mesh>(verts.data(), (int)(verts.size() / 8),
+                                               indices.data(), (int)indices.size(), true);
+            vox.cachedEntry = MergedMeshEntry{mesh, nullptr};
+        }
+        vox.dirty = false;
+    }
+
+    // Aggregate. Stamp bounds for distance + frustum cull.
+    std::vector<MergedMeshEntry> result;
+    result.reserve(gChunkVoxels.size());
+    for (const auto& [chunkCoord, vox] : gChunkVoxels) {
+        if (!vox.cachedEntry.mesh) continue;
+        MergedMeshEntry e = vox.cachedEntry;
+        e.boundsCenter = glm::vec3(chunkCoord) * (float)kChunkSize
+                       + glm::vec3(kChunkSize * 0.5f);
+        e.boundsRadius = chunkBoundsRadius;
+        result.push_back(std::move(e));
+    }
+    return result;
+}
+
 std::vector<MergedMeshEntry> buildSingleMeshes() {
     // SINGLE mode: rebuilds the full world every call. No caching.
     std::vector<const DrawInstance*> allInsts;
@@ -565,6 +961,17 @@ std::vector<MergedMeshEntry> buildMergedMeshes() {
         chunkInsts.reserve(bit->second.size());
         for (const auto& d : bit->second) chunkInsts.push_back(&d);
 
+        if (canChunkUseGreedy(chunkInsts)) {
+            // Greedy collapses the chunk to a single mesh; no inner/outer split.
+            build.innerMeshes.clear();
+            build.outerMeshes.clear();
+            MergedMeshEntry e = buildGreedyChunkMesh(chunkInsts, cullSet);
+            if (e.mesh) build.innerMeshes.push_back(std::move(e));
+            build.innerDirty = false;
+            build.outerDirty = false;
+            continue;
+        }
+
         glm::ivec3 chunkOrigin = chunkCoord * kChunkSize;
 
         if (build.innerDirty) {
@@ -583,10 +990,23 @@ std::vector<MergedMeshEntry> buildMergedMeshes() {
 
     // Aggregate every chunk's cached inner + outer meshes into the flat list
     // the renderer consumes. shared_ptr makes this cheap (refcount bump only).
+    // Stamp each entry with a bounding sphere covering the chunk cube so the
+    // render loop can distance-cull (fog cutoff, etc).
+    const float chunkBoundsRadius = (float)kChunkSize * 0.8660254f; // sqrt(3)/2
     std::vector<MergedMeshEntry> result;
     for (const auto& [chunkCoord, build] : gChunks) {
-        for (const auto& entry : build.innerMeshes) result.push_back(entry);
-        for (const auto& entry : build.outerMeshes) result.push_back(entry);
+        glm::vec3 center = glm::vec3(chunkCoord) * (float)kChunkSize
+                         + glm::vec3(kChunkSize * 0.5f);
+        for (const auto& entry : build.innerMeshes) {
+            result.push_back(entry);
+            result.back().boundsCenter = center;
+            result.back().boundsRadius = chunkBoundsRadius;
+        }
+        for (const auto& entry : build.outerMeshes) {
+            result.push_back(entry);
+            result.back().boundsCenter = center;
+            result.back().boundsRadius = chunkBoundsRadius;
+        }
     }
     return result;
 }

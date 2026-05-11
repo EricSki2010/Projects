@@ -17,6 +17,13 @@ struct PointLight {
     int shininess;
 };
 
+struct Fog {
+    bool enabled = false;
+    glm::vec3 color = glm::vec3(0.55f, 0.70f, 0.95f);
+    float start = 50.0f;
+    float end = 150.0f;
+};
+
 class Shader {
 public:
     unsigned int program;
@@ -38,6 +45,8 @@ public:
     glm::mat4 projection;
     glm::mat4 view;
     PointLight light;
+    Fog fog;
+    float farPlane = 500.0f;
 
     Scene(float aspectRatio);
     glm::mat3 getNormalMatrix(const glm::mat4& model) const;

@@ -1,7 +1,7 @@
 #include "render.h"
 
 Scene::Scene(float aspectRatio) {
-    projection = glm::perspective(glm::radians(45.0f), aspectRatio, 0.1f, 500.0f);
+    projection = glm::perspective(glm::radians(45.0f), aspectRatio, 0.1f, farPlane);
     view = glm::mat4(1.0f);
 
     light.position = glm::vec3(40.0f, 60.0f, 30.0f);
@@ -25,6 +25,10 @@ void Scene::uploadStaticUniforms(Shader& shader) const {
     glUniform1f(shader.loc("specularStrength"), light.specularStrength);
     glUniform1i(shader.loc("shininess"), light.shininess);
     glUniform1f(shader.loc("brightness"), 1.0f);
+    glUniform1i(shader.loc("fogEnabled"), fog.enabled ? 1 : 0);
+    glUniform3fv(shader.loc("fogColor"), 1, glm::value_ptr(fog.color));
+    glUniform1f(shader.loc("fogStart"), fog.start);
+    glUniform1f(shader.loc("fogEnd"), fog.end);
 }
 
 void Scene::uploadFrameUniforms(Shader& shader, const glm::mat4& model) const {

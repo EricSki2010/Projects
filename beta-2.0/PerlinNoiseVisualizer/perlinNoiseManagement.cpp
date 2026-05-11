@@ -16,6 +16,10 @@ float sample2D(float x, float y) {
     return stb_perlin_noise3_seed(x * sScale, y * sScale, 0.0f, 0, 0, 0, sSeed);
 }
 
+float sample2D(float x, float y, int seed) {
+    return stb_perlin_noise3_seed(x * sScale, y * sScale, 0.0f, 0, 0, 0, seed);
+}
+
 float sample3D(float x, float y, float z) {
     return stb_perlin_noise3_seed(x * sScale, y * sScale, z * sScale, 0, 0, 0, sSeed);
 }

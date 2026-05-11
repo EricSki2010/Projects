@@ -20,7 +20,7 @@ static void framebufferSizeCallback(GLFWwindow*, int width, int height) {
     ctx.width = width;
     ctx.height = height;
     if (ctx.scene)
-        ctx.scene->projection = glm::perspective(glm::radians(45.0f), (float)width / (float)height, 0.1f, 500.0f);
+        ctx.scene->projection = glm::perspective(glm::radians(45.0f), (float)width / (float)height, 0.1f, ctx.scene->farPlane);
 }
 
 namespace VE {
@@ -119,6 +119,12 @@ void reserveBlockCapacity(int approximateBlocks) {
 
 void draw(const char* meshName, float x, float y, float z,
           float rx, float ry, float rz) {
+    if (ctx.mode == CHUNK_VOXEL) {
+        // CHUNK_VOXEL ignores meshName/rotation; cell is just "filled".
+        setVoxelAt((int)roundf(x), (int)roundf(y), (int)roundf(z), 1);
+        ctx.needsRebuild = true;
+        return;
+    }
     if (sCollidersEnabled) {
         // Remove any existing collider at this position (e.g. ghost block)
         removeCollider(x, y, z);
@@ -135,28 +141,38 @@ void draw(const char* meshName, float x, float y, float z,
 }
 
 void undraw(float x, float y, float z) {
+    if (ctx.mode == CHUNK_VOXEL) {
+        setVoxelAt((int)roundf(x), (int)roundf(y), (int)roundf(z), 0);
+        ctx.needsRebuild = true;
+        return;
+    }
     removeDrawInstance(x, y, z);
     if (sCollidersEnabled) removeCollider(x, y, z);
     ctx.needsRebuild = true;
 }
 
 void clearDraws() {
+    if (ctx.mode == CHUNK_VOXEL) {
+        clearAllVoxels();
+        if (sCollidersEnabled) clearColliders();
+        ctx.needsRebuild = true;
+        return;
+    }
     clearDrawInstances();
     if (sCollidersEnabled) clearColliders();
     ctx.needsRebuild = true;
 }
 
 bool hasBlockAt(int x, int y, int z) {
+    if (ctx.mode == CHUNK_VOXEL) return hasVoxelAt(x, y, z);
     return hasColliderAt(x, y, z);
 }
 
 void rebuild() {
     ctx.mergedMeshes.clear();
-    if (ctx.mode == CHUNK) {
-        ctx.mergedMeshes = buildMergedMeshes();
-    } else {
-        ctx.mergedMeshes = buildSingleMeshes();
-    }
+    if (ctx.mode == CHUNK)            ctx.mergedMeshes = buildMergedMeshes();
+    else if (ctx.mode == CHUNK_VOXEL) ctx.mergedMeshes = buildVoxelChunkMeshes();
+    else                              ctx.mergedMeshes = buildSingleMeshes();
     ctx.needsRebuild = false;
 }
 
@@ -173,6 +189,87 @@ void setBrightness(float brightness) {
 void setSpecularStrength(float strength) {
     ctx.shader->use();
     glUniform1f(ctx.shader->loc("specularStrength"), strength);
+}
+
+static void uploadFogToShader(Shader* sh, const Fog& fog) {
+    if (!sh) return;
+    sh->use();
+    glUniform1i(sh->loc("fogEnabled"), fog.enabled ? 1 : 0);
+    glUniform3fv(sh->loc("fogColor"), 1, glm::value_ptr(fog.color));
+    glUniform1f(sh->loc("fogStart"), fog.start);
+    glUniform1f(sh->loc("fogEnd"), fog.end);
+}
+
+static int sCycleKey   = 0;
+static int sCycleMod   = 0;
+static bool sCycleHeld = false;
+
+static bool isModDown(int modKey) {
+    if (modKey == 0) return true;
+    if (modKey == GLFW_KEY_LEFT_CONTROL || modKey == GLFW_KEY_RIGHT_CONTROL)
+        return glfwGetKey(ctx.window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS
+            || glfwGetKey(ctx.window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
+    if (modKey == GLFW_KEY_LEFT_SHIFT || modKey == GLFW_KEY_RIGHT_SHIFT)
+        return glfwGetKey(ctx.window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS
+            || glfwGetKey(ctx.window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+    if (modKey == GLFW_KEY_LEFT_ALT || modKey == GLFW_KEY_RIGHT_ALT)
+        return glfwGetKey(ctx.window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS
+            || glfwGetKey(ctx.window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS;
+    return glfwGetKey(ctx.window, modKey) == GLFW_PRESS;
+}
+
+void setSceneCycleHotkey(int key, int modKey) {
+    sCycleKey  = key;
+    sCycleMod  = modKey;
+    sCycleHeld = false;
+}
+
+// Called from RenderLoop::processInput each frame, before the active scene's onInput.
+void pollSceneCycleHotkey() {
+    if (sCycleKey == 0 || !ctx.window) return;
+    bool keyDown = glfwGetKey(ctx.window, sCycleKey) == GLFW_PRESS;
+    bool combo   = keyDown && isModDown(sCycleMod);
+    if (combo && !sCycleHeld)
+        cycleToNextScene();
+    sCycleHeld = combo;
+}
+
+void setFarPlane(float farPlane) {
+    if (!ctx.scene) return;
+    ctx.scene->farPlane = farPlane;
+    float aspect = (float)ctx.width / (float)ctx.height;
+    ctx.scene->projection = glm::perspective(glm::radians(45.0f), aspect, 0.1f, farPlane);
+}
+
+void setFog(bool enable, glm::vec3 color, float start, float end) {
+    if (!ctx.scene) return;
+    ctx.scene->fog.enabled = enable;
+    ctx.scene->fog.color = color;
+    ctx.scene->fog.start = start;
+    ctx.scene->fog.end = end;
+    uploadFogToShader(ctx.shader.get(), ctx.scene->fog);
+    uploadFogToShader(ctx.vcShader.get(), ctx.scene->fog);
+    if (ctx.shader) ctx.shader->use();
+}
+
+void undrawChunkAt(int chunkX, int chunkY, int chunkZ) {
+    glm::ivec3 chunkCoord(chunkX, chunkY, chunkZ);
+    if (ctx.mode == CHUNK_VOXEL) {
+        clearVoxelChunk(chunkCoord);
+        ctx.needsRebuild = true;
+        return;
+    }
+    if (sCollidersEnabled) {
+        const std::vector<DrawInstance>* bucket = getChunkInstances(chunkCoord);
+        if (bucket) {
+            std::vector<glm::vec3> positions;
+            positions.reserve(bucket->size());
+            for (const auto& d : *bucket) positions.push_back(d.position);
+            for (const auto& p : positions) removeCollider(p.x, p.y, p.z);
+        }
+    }
+    clearChunkInstances(chunkCoord);
+    ctx.needsRebuild = true;
 }
 
 void registerScene(const std::string& name, std::function<void(std::shared_ptr<void>)> onEnter,
@@ -200,7 +297,7 @@ void run() {
     if (ctx.vcShader) ctx.scene->uploadStaticUniforms(*ctx.vcShader);
     double lastTime = glfwGetTime();
 
-    rebuild();
+    if (ctx.needsRebuild) rebuild();
 
     while (!glfwWindowShouldClose(ctx.window)) {
         double now = glfwGetTime();

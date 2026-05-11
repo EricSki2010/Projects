@@ -72,11 +72,17 @@ VisualEngine/
 `VE::setGradientBackground(enable, top = {0,0,0}, bottom = {0.7,0.7,0.7})`
   Enables/disables a 3D gradient background that follows the camera view direction. Top color when looking up, bottom color when looking down.
 
+`VE::setFarPlane(farPlane)`
+  Sets the perspective projection's far clip distance for the active scene and rebuilds `ctx.scene->projection` immediately. Default is 500 (set in `Scene` constructor). The value is also re-applied on framebuffer resize and is read by `Camera::getProjectionMatrix`. Persists across scene swaps (each scene that cares should set its own value in `onEnter`, mirroring the `setFog` / `setBrightness` pattern).
+
 `VE::registerScene(name, onEnter, onExit, onInput, onUpdate, onRender)`
   Registers a named scene with lifecycle hooks. onEnter receives `void* data`. See Scene Management section.
 
 `VE::setScene(name, data = nullptr)`
   Switches to a registered scene. Optional `void* data` is passed to the new scene's onEnter.
+
+`VE::setSceneCycleHotkey(key, modKey = 0)`
+  Engine-managed hotkey that cycles through registered scenes on rising edge. See SCENE MANAGEMENT section for details.
 
 `VE::run()`
   Starts the main loop: processInput -> update -> render -> swap. Blocks until window closes. Calls active scene's onExit before cleanup.
@@ -111,7 +117,7 @@ bound, textured/solid meshes with `ctx.shader`.
   `shader.loc(name) -> int` — returns cached uniform location.
 
 `Scene(aspectRatio)`
-  Holds projection matrix, view matrix, and a PointLight.
+  Holds projection matrix, view matrix, a PointLight, a Fog, and `farPlane` (perspective far clip, default 500). Mutate `farPlane` via `VE::setFarPlane()` so the projection matrix is rebuilt to match.
   `scene.uploadStaticUniforms(shader)` — uploads light properties and default brightness (once).
   `scene.uploadFrameUniforms(shader, model)` — uploads model/projection/normal matrices (per frame).
 
@@ -369,6 +375,12 @@ bound, textured/solid meshes with `ctx.shader`.
 
 `getActiveSceneName() -> string&`
   Returns the name of the currently active scene.
+
+`cycleToNextScene()`
+  Cycles to the next scene in registration order (wraps). No-op if fewer than 2 scenes registered or no scene is active. Used internally by `VE::setSceneCycleHotkey`.
+
+`VE::setSceneCycleHotkey(key, modKey = 0)`
+  Registers an engine-managed hotkey (`modKey + key`, both GLFW key codes) that cycles through registered scenes on rising edge — a held key only fires once. Pass `key=0` to disable. `modKey=0` requires no modifier. Passing a left/right variant of CONTROL/SHIFT/ALT accepts either side. The engine polls this once per frame in `processInput` before the active scene's `onInput`, so per-scene swap statics aren't needed (and would re-trigger across scenes anyway because each scene's static is only updated while that scene is active).
 
 
 ## MEMORY MANAGEMENT
