@@ -145,7 +145,26 @@ std::unique_ptr<Mesh> Mesh::createVertexColored(const float* verts, int vertCoun
     return m;
 }
 
+std::unique_ptr<Mesh> Mesh::createArenaSlice(unsigned int sharedVAO,
+                                             size_t indexByteOffset,
+                                             int idxCount,
+                                             int baseVertex) {
+    std::unique_ptr<Mesh> m(new Mesh());
+    m->VAO                   = sharedVAO;
+    m->VBO                   = 0;
+    m->EBO                   = 0;
+    m->indexCount            = idxCount;
+    m->texture               = nullptr;
+    m->color                 = glm::vec3(0.8f);
+    m->vertexColored         = false;
+    m->arenaSlice            = true;
+    m->arenaIndexByteOffset  = indexByteOffset;
+    m->arenaBaseVertex       = baseVertex;
+    return m;
+}
+
 Mesh::~Mesh() {
+    if (arenaSlice) return; // arena owns the GL objects; nothing to release
     glDeleteVertexArrays(1, &VAO);
     glDeleteBuffers(1, &VBO);
     glDeleteBuffers(1, &EBO);
@@ -175,5 +194,12 @@ void Mesh::draw(Shader& shader) {
     }
 
     glBindVertexArray(VAO);
-    glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, 0);
+    if (arenaSlice) {
+        // Draw a slice of the arena: indices live at arenaIndexByteOffset in
+        // the shared EBO; their values are relative to arenaBaseVertex.
+        glDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT,
+                                 (void*)arenaIndexByteOffset, arenaBaseVertex);
+    } else {
+        glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, 0);
+    }
 }

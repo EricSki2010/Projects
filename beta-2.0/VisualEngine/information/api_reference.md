@@ -142,6 +142,17 @@ bound, textured/solid meshes with `ctx.shader`.
   stream (e.g. loading vertex-colored GLBs or future chunk meshes with
   COLOR_0). Caller owns the returned pointer.
 
+`Mesh::createArenaSlice(sharedVAO, indexByteOffset, indexCount, baseVertex) -> Mesh*`
+  Static factory for callers that manage their own pooled VAO/VBO/EBO (e.g.
+  chunk streamers that want a single arena holding many meshes). The returned
+  Mesh allocates **no** GL resources — it just records the shared VAO and the
+  byte/vertex offsets into the arena, and `draw()` issues
+  `glDrawElementsBaseVertex(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT,
+  indexByteOffset, baseVertex)`. The destructor skips `glDelete*`. Caller
+  must keep the underlying arena alive at least as long as the slice.
+  `mesh.arenaSlice` is true for these; `texture`/`color`/`vertexColored`
+  still work the same way.
+
   `mesh.setTexture(tex)` — assigns a texture.
   `mesh.setColor(color)` — sets a solid color.
   `mesh.vertexColored` — true for meshes built via `createVertexColored`;

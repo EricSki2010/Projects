@@ -75,6 +75,14 @@ public:
     glm::vec3 color = glm::vec3(0.8f);
     bool vertexColored = false; // true when built from pos+normal+color stream
 
+    // Arena-slice mode: this Mesh does NOT own VAO/VBO/EBO — it references a
+    // shared VAO (from a chunk arena) and draws via glDrawElementsBaseVertex
+    // at the given byte/vertex offsets. Destructor skips glDelete in this mode.
+    // Caller is responsible for keeping the underlying arena alive.
+    bool   arenaSlice          = false;
+    size_t arenaIndexByteOffset = 0;
+    int    arenaBaseVertex      = 0;
+
     Mesh(float* vertices, int vertexCount, unsigned int* indices, int indexCount);
     Mesh(float* verticesWithNormals, int vertexCount, unsigned int* indices, int indexCount, bool hasNormals);
     ~Mesh();
@@ -86,13 +94,23 @@ public:
                                                      int vertexCount,
                                                      const unsigned int* indices,
                                                      int indexCount);
+
+    // Arena-slice factory. Wraps a draw of an arena's shared VAO with offsets
+    // — does NOT allocate any GL resources. Use when many small meshes share
+    // a single VBO/EBO/VAO (e.g. chunk streaming) to avoid per-mesh glGen +
+    // glBufferData driver-pool churn.
+    static std::unique_ptr<Mesh> createArenaSlice(unsigned int sharedVAO,
+                                                  size_t indexByteOffset,
+                                                  int indexCount,
+                                                  int baseVertex);
+
     Mesh(const Mesh&) = delete;
     Mesh& operator=(const Mesh&) = delete;
     void setTexture(Texture* tex);
     void setColor(glm::vec3 col);
     void draw(Shader& shader);
 private:
-    Mesh() = default; // used by createVertexColored
+    Mesh() = default; // used by createVertexColored / createArenaSlice
     void computeNormals(float* vertices, int vertexCount, unsigned int* indices, int indexCount,
                         float* outBuffer);
 };
