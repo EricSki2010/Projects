@@ -1,3 +1,7 @@
+# Notes
+
+This is purely a test, the files are in disorder, just a prototype.
+
 # PerlinNoiseVisualizer Architecture
 
 How the 3D voxel world is generated, meshed, and uploaded across multiple threads. The `"noise2D"` scene is trivial in comparison — one quad built once in `onEnter` — and isn't covered here. See [api_reference.md](api_reference.md) for its entry point.
