@@ -7,6 +7,14 @@
 
 #include <GLFW/glfw3.h>
 
+// Single entry-point for switching scenes that also locks in the world seed.
+// Use this instead of VE::setScene directly so the noise system is always
+// consistent with the active scene.
+static void setScene(const char* name, int seed) {
+    PerlinNoise::setSeed(seed);
+    VE::setScene(name);
+}
+
 int main() {
     VE::initWindow(1280, 800, "Perlin Noise Visualizer", true);
     VE::setCollidersEnabled(false);
@@ -16,14 +24,12 @@ int main() {
                            cubeFaceStates, nullptr, false);
 
     VE::setMode(VE::CHUNK_VOXEL);
-
-    PerlinNoise::setSeed(42);
     PerlinNoise::setScale(0.050f);
 
     registerVisualizerScene();
     registerNoise2DScene();
     VE::setSceneCycleHotkey(GLFW_KEY_2, GLFW_KEY_LEFT_CONTROL); // Ctrl+2 cycles scenes
-    VE::setScene("noise2D"); // swap to "visualizer" for the 3D Perlin scene
+    setScene("noise2D", 10); // first arg = scene name, second arg = world seed
     VE::run();
     return 0;
 }

@@ -28,3 +28,19 @@ const char* biomeName(Biome b);
 // biome. Higher = taller peaks. The 3D scene IDW-blends this between
 // neighboring biomes so amplitude transitions are smooth across boundaries.
 float biomeTopRampDepth(Biome b);
+
+// Thread-safe cached lookup keyed on integer world coords. First call at a
+// position computes via getBiome and stores; subsequent calls anywhere (any
+// worker) hit a shared map. Massive win for chunk generators that sample the
+// same world cells across overlapping padding regions.
+Biome getCachedBiome(int x, int z);
+
+// Drops the entire shared cache. Call on scene exit or seed change.
+void clearBiomeCache();
+
+// Hint the expected steady-state cache size so we can pre-allocate buckets and
+// avoid mid-load rehashing hitches. Safe to call at scene enter.
+void reserveBiomeCache(size_t expectedEntries);
+
+// Current entry count in the shared cache. Cheap (just a load under shared lock).
+size_t biomeCacheSize();
